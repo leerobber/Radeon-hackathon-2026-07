@@ -14,6 +14,11 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if args.len() > 1 && args[1] == "fast" {
+        fast_mode()?;
+        return Ok(());
+    }
+
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(tools::VcfAnalyzerTool));
     registry.register(Box::new(tools::LdBlockTool));
@@ -38,5 +43,27 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn fast_mode() -> anyhow::Result<()> {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(tools::VcfAnalyzerTool));
+    registry.register(Box::new(tools::LdBlockTool));
+    registry.register(Box::new(tools::HaplotypeToolTool));
+
+    let mut agent = GenomicAgent::new(registry);
+
+    let queries = vec![
+        "Analyze the VCF file and tell me about SNP distribution",
+        "What are the linkage disequilibrium blocks in this region?",
+        "Find haplotype patterns for variants with MAF > 0.05",
+    ];
+
+    for query in queries {
+        let _response = agent.process_query(query)?;
+    }
+
+    println!("✓ 3 queries processed in ultra-fast mode");
     Ok(())
 }
