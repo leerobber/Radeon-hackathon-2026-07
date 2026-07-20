@@ -2,6 +2,7 @@ mod agent;
 mod tools;
 mod bench;
 mod vcf;
+mod gpu_ld;
 
 use agent::GenomicAgent;
 use tools::ToolRegistry;
@@ -12,6 +13,11 @@ fn main() -> anyhow::Result<()> {
 
     if args.len() > 1 && args[1] == "bench" {
         bench::run_benchmarks()?;
+        return Ok(());
+    }
+
+    if args.len() > 1 && args[1] == "gpu-bench" {
+        bench::run_gpu_benchmark()?;
         return Ok(());
     }
 
