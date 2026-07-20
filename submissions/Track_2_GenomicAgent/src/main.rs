@@ -1,6 +1,7 @@
 mod agent;
 mod tools;
 mod bench;
+mod vcf;
 
 use agent::GenomicAgent;
 use tools::ToolRegistry;

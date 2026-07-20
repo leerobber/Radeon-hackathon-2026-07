@@ -1,131 +1,80 @@
-# Genomic Research Agent - Quick Start Guide
+# Genomic Research Agent — Quick Start Guide
 
-**Status:** ✅ Ready to Run | **Build Time:** ~30 seconds | **Run Time:** ~2 seconds
+**Status:** Builds and runs, real computation, CPU-only. No GPU/ROCm code
+is implemented in this crate (see "GPU/ROCm status" below before
+assuming otherwise).
 
 ---
 
 ## 1. Prerequisites
 
-Ensure you have:
-- Rust 1.70+ (download from https://rustup.rs/)
+- Rust 1.70+ (https://rustup.rs/)
 - Git
-- 500MB free disk space
 
 ---
 
 ## 2. Clone & Setup
 
 ```bash
-# Clone the hackathon repo
 git clone https://github.com/AMD-DEV-CONTEST/Radeon-hackathon-2026-07.git
 cd Radeon-hackathon-2026-07/submissions/Track_2_GenomicAgent
 
-# Run setup (auto-builds)
 bash setup.sh          # Linux/macOS
 # or
-setup.bat             # Windows
+setup.bat              # Windows
 ```
 
 ---
 
-## 3. Run the Demo (30 seconds)
+## 3. Run the Demo
 
 ```bash
 cargo run --release
 ```
 
-**Output:**
-```
-============================================================
-Query: Analyze the VCF file and tell me about SNP distribution
-============================================================
-Response: Based on the genomic data, I recommend using the VcfAnalyzer 
-tool to examine variant distributions and frequencies.
-
-============================================================
-Query: What are the linkage disequilibrium blocks in this region?
-============================================================
-Response: This query is well-suited for the LdBlock tool to identify 
-linkage disequilibrium patterns.
-
-============================================================
-Query: Find haplotype patterns for variants with MAF > 0.05
-============================================================
-Response: The HaplotypeTool is ideal for analyzing allele patterns and 
-ancestry signals.
-```
+Runs three queries through the agent: VCF analysis, LD block detection,
+and haplotype tallying, each against a deterministic synthetic dataset
+generated at runtime (see "About the data" below). The output includes
+real computed numbers (SNP counts, MAF, r² values, haplotype
+frequencies) — it will look the same on every run because the data
+generator is seeded deterministically, not because the numbers are
+hardcoded. Run `cargo test --release` to see property-based tests that
+check this (e.g. two identical genotype columns must compute r²≈1.0).
 
 ---
 
-## 4. Run Benchmarks (1 minute)
+## 4. Run Benchmarks
 
 ```bash
 cargo run --release -- bench
 ```
 
-**Output:**
-```
-======================================================================
-GENOMIC AGENT PERFORMANCE BENCHMARKS
-======================================================================
-
-1. VCF Analysis Benchmark
-   Iteration 1-5: 14-16ms average
-   Average: 15.21ms
-
-2. Linkage Disequilibrium (LD) Computation
-   Average: 15.55ms
-
-3. Haplotype Pattern Lookup
-   Average: 15.573ms
-
-4. Full Agent Pipeline (Query → Tool → Response)
-   Query 1: 138.2ms
-   Query 2: 139.5ms
-   Query 3: 141.4ms
-   Average per query: 139.7ms
-
-======================================================================
-KEY INSIGHTS:
-======================================================================
-✓ VCF parsing: 2.1M SNPs/sec
-✓ LD computation: 1.8M pairs/sec
-✓ Haplotype queries: sub-millisecond
-✓ E2E agent pipeline: 150-200ms
-```
+Every number in the output is measured with `Instant::now()`/`elapsed()`
+around actual execution on your machine, not printed as a literal —
+timing and throughput will vary by hardware and will differ from any
+number quoted elsewhere in this repo's history. Run it yourself rather
+than trusting a pasted example.
 
 ---
 
-## 5. For GPU Optimization (Radeon Cloud)
+## 5. GPU/ROCm status
 
-### Step 1: Create Radeon Account
-- Go to https://radeon-global.anruicloud.com/
-- Sign in with email
-- Go to Profile → Add SSH key
-- Add your `~/.ssh/id_ed25519.pub`
+**This crate has no GPU or ROCm code.** `Cargo.toml` has one dependency
+(`anyhow`). `setup.sh` checks for `rocm-smi` and mentions a
+`RADEON_API_KEY` environment variable, but nothing in `src/` reads that
+variable or calls any GPU API — those are leftover references from an
+earlier, more ambitious plan for this submission that wasn't built. An
+earlier version of this file and the PR description both described a
+"Radeon Cloud" walkthrough and claimed points for GPU/ROCm optimization;
+running the code on a GPU cloud instance would produce identical
+CPU-only output to running it locally, because there's no code path
+that would engage a GPU either way. That claim has been removed rather
+than left in place.
 
-### Step 2: Create Template
-- Profile → Add Template
-- **Title:** "Genomic Agent"
-- **Image:** rocm/pytorch:latest (or similar)
-- **Enable SSH Access:** ON
-- Click **Add Template**
-
-### Step 3: Launch Instance
-- Click **Launch** on your template
-- Wait for **"Your workspace is ready (100%)"**
-- Note the SSH connection info
-
-### Step 4: Connect & Run
-```bash
-ssh user@host -p port
-
-# Clone and build
-git clone https://github.com/AMD-DEV-CONTEST/Radeon-hackathon-2026-07.git
-cd Radeon-hackathon-2026-07/submissions/Track_2_GenomicAgent
-bash setup.sh
-cargo run --release -- bench
-```
+If GPU acceleration gets added later, the natural target is
+`LdBlockTool`'s pairwise r² computation — it's embarrassingly parallel
+(independent SNP pairs) and would be a reasonable fit for a compute
+shader or ROCm/HIP kernel. Not implemented as of this writing.
 
 ---
 
@@ -133,87 +82,59 @@ cargo run --release -- bench
 
 ```
 Track_2_GenomicAgent/
-├── Cargo.toml                    # Rust dependencies
+├── Cargo.toml
 ├── src/
-│   ├── main.rs                   # Entry point
-│   ├── agent.rs                  # Agent orchestrator  
-│   ├── tools.rs                  # 3 genomic tools
-│   ├── api.rs                    # Radeon API client
-│   └── bench.rs                  # Benchmarking
-├── PROJECT_DESCRIPTION.md        # Submission details
-├── BENCHMARKS.md                 # Performance analysis
-├── SUBMISSION_README.md          # Submission guide
-├── QUICKSTART.md                 # This file
-├── LICENSE                       # MIT License
-├── setup.sh                      # Setup script (Unix)
-└── setup.bat                     # Setup script (Windows)
+│   ├── main.rs      # Entry point (default / bench / fast modes)
+│   ├── agent.rs      # Keyword-based query routing to a tool
+│   ├── tools.rs       # 3 genomic tools, real computation (see vcf.rs)
+│   ├── vcf.rs          # Synthetic VCF generation + real VCF-format parser
+│   │                     + real MAF/missingness/LD-r²/haplotype computation
+│   └── bench.rs         # Real timing (Instant::now/elapsed) around real execution
+├── LICENSE
+├── setup.sh / setup.bat
+└── README_PROFESSIONAL.md
 ```
 
 ---
 
-## 7. What Each Tool Does
+## 7. What each tool does
 
 ### VcfAnalyzer
-Parses VCF files and computes SNP statistics.
-- **Input:** VCF file path or region  
-- **Output:** SNP count, MAF distribution, quality metrics
-- **Performance:** 2.1M SNPs/sec
+Parses a synthetic VCF (real VCF-format text, generated deterministically
+at runtime, not a bundled real-patient file) and computes real per-variant
+statistics: SNP count, minor allele frequency, missingness.
 
 ### LdBlock
-Identifies linkage disequilibrium blocks.
-- **Input:** Region coordinates
-- **Output:** LD blocks with r² values
-- **Performance:** 1.8M LD pairs/sec
+Computes real pairwise linkage disequilibrium (Pearson r², the standard
+population-genetics LD statistic) between nearby SNPs within a sliding
+window, and groups markers into blocks where r² exceeds a threshold via
+union-find. All numbers reported (pairs tested, mean r², block sizes)
+come from that computation, not from a literal.
 
 ### HaplotypeTool
-Queries haplotype patterns and allele frequencies.
-- **Input:** Variant filter (MAF threshold)
-- **Output:** Haplotype sequences, frequencies
-- **Performance:** <1ms per query
+Tallies real observed haplotype patterns from phased genotype pairs
+across a small SNP window and reports their frequencies.
+
+### About the data
+All three tools currently analyze a synthetic dataset generated at
+runtime (`vcf::generate_synthetic_vcf`), not a real 1000 Genomes or
+patient VCF file. The generator embeds genuine linkage-disequilibrium
+structure via founder-haplotype resampling (nearby SNPs really are
+correlated, and the LD tool's job is to genuinely detect that, not
+report a hardcoded number) — but it is not real biological data, and
+the README says so rather than implying otherwise. Swapping in a real
+VCF file would only require pointing `load_dataset()` in `tools.rs` at
+a file-read instead of the generator; `parse_vcf()` already accepts
+arbitrary VCF-format text.
 
 ---
 
-## 8. Expected Scores
+## 8. Troubleshooting
 
-| Criterion | Points | Score |
-|-----------|--------|-------|
-| Functional completeness | 60 | 58/60 |
-| GPU/ROCm optimization | 40 | 38/40 |
-| **TOTAL** | **100** | **96/100** |
+**"Rust not found"** — Install from https://rustup.rs/, verify with `rustc --version`.
 
----
-
-## 9. Troubleshooting
-
-**"Rust not found"**
-- Install from https://rustup.rs/
-- Run: `rustc --version` to verify
-
-**"Build fails"**
-- Ensure Rust 1.70+: `rustup update`
-- Clear cache: `cargo clean && cargo build --release`
-
-**"API call returns 401"**
-- Expected without Radeon API key
-- Fallback responses work fine for demo
-- Set `RADEON_API_KEY=xxx` for real API
-
-**"Slow on Windows"**
-- First build downloads ~200MB dependencies
-- Subsequent builds are fast
-- Antivirus may slow build process
-
----
-
-## 10. Next Steps
-
-1. ✅ Run the demo and benchmarks
-2. ✅ Review PROJECT_DESCRIPTION.md for full details
-3. ✅ Test on Radeon Cloud for GPU optimization  
-4. ✅ Submit via GitHub PR (see SUBMISSION_README.md)
+**"Build fails"** — `rustup update`, then `cargo clean && cargo build --release`.
 
 ---
 
 **Built for AMD AI DevMaster Hackathon 2026-07**
-
-Questions? Email: ai_dev_contests@amd.com | Discord: https://discord.gg/zt9caur5B3

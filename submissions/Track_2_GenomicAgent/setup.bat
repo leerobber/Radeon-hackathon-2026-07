@@ -55,9 +55,8 @@ echo Quick start commands:
 echo   1. Run demo:        cargo run --release
 echo   2. Run benchmarks:  cargo run --release -- bench
 echo.
-echo For Radeon GPU optimization:
-echo   1. Create Radeon Cloud account: https://radeon-global.anruicloud.com/
-echo   2. Set RADEON_API_KEY environment variable
-echo   3. Run: cargo run --release
+echo Note: this build has no GPU/ROCm code path. RADEON_API_KEY is not
+echo read anywhere in src/ -- setting it has no effect. See README_PROFESSIONAL.md
+echo section 5 (GPU/ROCm status) for details.
 echo.
 pause
