@@ -16,23 +16,25 @@
 //! one, which is why raw tool output is always still included in the
 //! final response alongside the narrative.
 //!
-//! **Backend order, and why:** (1) AMD's own Model API
+//! **Backend order, and why:** (0) **real local inference on this
+//! machine's Radeon 780M** (`local_llm.rs`, `LOCAL_MODEL_GGUF_PATH`,
+//! only in a `local-inference`-feature build) is tried first when
+//! available -- an actual neural-network forward pass dispatched to
+//! the AMD GPU via llama.cpp's Vulkan backend, not a cloud API call.
+//! This is what satisfies Track 2's "local inference execution"
+//! criterion; everything below it does not. (1) AMD's own Model API
 //! (`AMD_MODEL_API_KEY`, `developer.amd.com.cn/radeon/modelapis`) is
-//! tried first -- it's the hackathon platform's own free, shared,
+//! tried next -- it's the hackathon platform's own free, shared,
 //! OpenAI-compatible endpoint (Token Factory grants a key with no GPU
-//! instance and no credits spent), and the most on-theme choice for an
-//! AMD-hosted submission. **Important, stated plainly: this is a
-//! remote cloud call, not local inference on this machine's Radeon
-//! 780M** -- it does not, by itself, satisfy Track 2's "local
-//! inference execution on AMD Radeon GPU" judging criterion. It's
-//! included because it's real, free, and AMD's own infrastructure, not
-//! because it substitutes for local inference. (2) Hugging Face's
-//! Inference Router (`HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`) is tried
-//! second -- also free-tier and OpenAI-compatible, verified working
-//! end-to-end before being wired in. (3) Anthropic (`ANTHROPIC_API_KEY`)
-//! is tried third, for anyone who already has a funded key. All three
-//! are genuinely optional and independent -- none configured, or an
-//! unfunded/rate-limited key, gets a clean fallthrough to raw tool
+//! instance and no credits spent), and the most on-theme remote choice
+//! for an AMD-hosted submission, but **stated plainly: it is a remote
+//! cloud call, not local inference**. (2) Hugging Face's Inference
+//! Router (`HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`) is tried next --
+//! also free-tier and OpenAI-compatible, verified working end-to-end
+//! before being wired in. (3) Anthropic (`ANTHROPIC_API_KEY`) is tried
+//! last, for anyone who already has a funded key. All four are
+//! genuinely optional and independent -- none configured/available, or
+//! all fail, gets a clean fallthrough to raw tool
 //! output, not an error, and none of them ever affects which tools ran
 //! or what they computed.
 
@@ -82,6 +84,11 @@ fn amd_model_name() -> String {
 /// Try each configured backend in order, returning the first one that
 /// produces a response. `synthesize` is the only caller.
 fn call_llm(system: &str, user: &str, max_tokens: u32) -> Option<String> {
+    #[cfg(feature = "local-inference")]
+    if let Some(result) = crate::local_llm::call_local_model(system, user, max_tokens) {
+        return Some(result);
+    }
+
     call_amd_model_api(system, user, max_tokens)
         .or_else(|| call_hf_router(system, user, max_tokens))
         .or_else(|| call_anthropic(system, user, max_tokens))

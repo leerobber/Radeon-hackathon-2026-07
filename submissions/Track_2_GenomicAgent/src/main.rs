@@ -8,6 +8,8 @@ mod llm;
 mod bootstrap;
 mod fst;
 mod intent;
+#[cfg(feature = "local-inference")]
+mod local_llm;
 
 use agent::GenomicAgent;
 use tools::ToolRegistry;
@@ -28,6 +30,12 @@ fn main() -> anyhow::Result<()> {
 
     if args.len() > 1 && args[1] == "fast" {
         fast_mode()?;
+        return Ok(());
+    }
+
+    #[cfg(feature = "local-inference")]
+    if args.len() > 1 && args[1] == "local-bench" {
+        local_llm::run_local_bench()?;
         return Ok(());
     }
 

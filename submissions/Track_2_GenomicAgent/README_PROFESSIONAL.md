@@ -14,23 +14,30 @@ confidence intervals, a per-SNP FST selection scan, and a real (not
 just synthetic) 1000 Genomes data mode — see "Advanced capabilities"
 and "About the data" below for what's actually verified about each.
 
-**Judging-criteria gap, stated plainly:** Track 2's published rubric
+**Judging-criteria status, stated plainly:** Track 2's published rubric
 (100 points) splits as 60 for functional completeness/application
 value and 40 for "AMD Radeon GPU and ROCm optimization, including local
 inference execution and inference-speed optimization." This submission
 has real, verified AMD GPU compute (`wgpu`/Vulkan, explicitly AMD-
 adapter-targeted, cross-validated against CPU on every run) for LD,
-PCA, and BM25 tool planning -- but no local AI model inference on the
-GPU. The three optional narration backends (AMD Model API, HF Inference
-Router, Anthropic) are all remote cloud calls, not local inference,
-regardless of which one answers. That means this submission likely
-scores well on the 60-point functional/completeness axis and on the
-GPU-utilization *portion* of the 40-point axis, but does not currently
-claim the "local inference execution" component of that axis. Not
-hidden in fine print -- stated here, at the top, because it materially
-affects how this should be scored and I'd rather say so than let the
-"GPU-accelerated" framing elsewhere in this doc be read as covering
-something it doesn't.
+PCA, and BM25 tool planning, **and now also real local AI model
+inference on the same AMD Radeon 780M**, via an optional
+`local-inference` Cargo feature (`src/local_llm.rs`, llama.cpp's Vulkan
+backend, not ROCm/HIP -- see "Local LLM inference" below for exactly
+why, and for real measured tokens/sec on this hardware). It is opt-in,
+not the default build, because it pulls in a full C++/CMake/Vulkan-SDK
+build dependency that a plain `cargo build --release` should not be
+forced to pay for; a judge running the default build gets the exact
+same build as before this feature existed, and everything below still
+describes that default build unless it says otherwise. With the
+feature enabled and a GGUF model file present, local inference is tried
+*first* in the narration backend chain (`src/llm.rs`), before any of
+the three remote API backends -- so the default `local-inference`-
+enabled demo run has zero per-query network dependency for narration.
+The three remote narration backends (AMD Model API, HF Inference
+Router, Anthropic) remain as documented fallbacks below; they are
+cloud calls, not local inference, and are not what closes this rubric
+gap -- the local-inference feature is.
 
 ---
 
@@ -185,13 +192,20 @@ rather than a human's zero).
 
 **Optional, additive-only:** an LLM backend, if configured, narrates the
 already-selected tools' real output in plain English afterward — it
-never influences which tools ran:
+never influences which tools ran. Four independent backends are tried
+in order, and the first one that's available/reachable wins:
 
 ```bash
-export AMD_MODEL_API_KEY=...     # tried first: AMD's own free Model API
+# tried first, only in a `local-inference`-feature build: real local
+# inference on this machine's AMD Radeon GPU -- see "Local LLM
+# inference" below for setup and real measured numbers
+cargo build --release --features local-inference
+export LOCAL_MODEL_GGUF_PATH=/path/to/model.gguf
+
+export AMD_MODEL_API_KEY=...     # tried second: AMD's own free Model API
                                   # (Token Factory, developer.amd.com.cn/radeon/modelapis)
-export HF_TOKEN=hf_...           # tried second: free tier, huggingface.co/settings/tokens
-export ANTHROPIC_API_KEY=sk-...  # tried third, if you have a funded key
+export HF_TOKEN=hf_...           # tried third: free tier, huggingface.co/settings/tokens
+export ANTHROPIC_API_KEY=sk-...  # tried fourth, if you have a funded key
 cargo run --release
 ```
 
@@ -204,20 +218,82 @@ fallback chain handles that error and moves on correctly. It has NOT
 been exercised end-to-end with a real, valid key (Token Factory
 requires its own account signup this dev environment doesn't have), the
 way the HF Router backend was before being wired in. **It is also, like
-the other two, a remote cloud API call, not local inference on this
-machine's Radeon GPU** -- see "Judging-criteria gap" below for why that
-distinction matters for this specific hackathon's Track 2 rubric.
+the HF and Anthropic backends, a remote cloud API call, not local
+inference on this machine's Radeon GPU** -- unlike the local-inference
+backend above it, which is. See "Local LLM inference" below for what
+makes that one different.
 
-None of the three variables set, or a request to all three fails
-(network, rate limit, no credits) → clean fallthrough to showing raw
-tool output instead of a narrative, not an error, and tool selection is
-completely unaffected either way. `--fast` mode never attempts the
-optional LLM call at all, since it's measuring this crate's own
-per-query overhead, not third-party API latency — tool selection
-quality is identical to the default mode either way, since planning
-never depended on a network call to begin with. See `src/agent.rs` for
-the wiring and `src/llm.rs`
-for the (now narration-only) backend implementation.
+None of the four backends available/configured, or all fail (network,
+rate limit, no credits, missing model file) → clean fallthrough to
+showing raw tool output instead of a narrative, not an error, and tool
+selection is completely unaffected either way. `--fast` mode never
+attempts any LLM call at all, since it's measuring this crate's own
+per-query overhead, not backend latency — tool selection quality is
+identical to the default mode either way, since planning never depended
+on a network call or a local model to begin with. See `src/agent.rs`
+for the wiring, `src/llm.rs` for the three remote (narration-only)
+backends, and `src/local_llm.rs` for the local one.
+
+### Local LLM inference (optional `local-inference` feature)
+
+Real local AI model inference on this machine's AMD Radeon 780M, via
+[llama.cpp](https://github.com/ggml-org/llama.cpp)'s Vulkan backend --
+an actual neural-network forward pass dispatched to the AMD GPU, not a
+cloud API call. This is what closes the "local inference execution"
+component of Track 2's rubric; everything else in this doc's LLM
+section is a remote call.
+
+**Why Vulkan, not ROCm/HIP:** there's an open, current upstream issue
+(ggml-org/llama.cpp #20839, corroborated by ROCm/ROCm #6049) documenting
+that AMD's own ROCm rocBLAS library is missing Tensile kernels for
+gfx1103 (this exact chip) -- the reporter's own fix was switching to
+llama.cpp's Vulkan backend. Same reasoning already used by every other
+GPU kernel in this crate (`gpu_ld.rs`'s `wgpu`/Vulkan kernels), just via
+llama.cpp's own independent Vulkan context.
+
+**Opt-in, not default:** building this requires a full C++/CMake/Vulkan-SDK
+toolchain that a plain `cargo build --release` should not be forced to
+pay for. It's behind a Cargo feature flag; the default build is
+completely unaffected (confirmed: `cargo test --release`, both with and
+without the feature, both pass all 42 existing tests with zero
+difference).
+
+```bash
+cargo build --release --features local-inference
+export LOCAL_MODEL_GGUF_PATH=/path/to/qwen2.5-1.5b-instruct-q4_k_m.gguf
+cargo run --release --features local-inference -- local-bench
+```
+
+No auto-download: the GGUF model file is a real, one-time download you
+make yourself (this was verified with
+[Qwen2.5-1.5B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF),
+Q4_K_M quantization, ~1.1 GB).
+
+**Real measured result on this dev machine** (AMD Ryzen 7 250 w/ Radeon
+780M Graphics, laptop with an additional discrete NVIDIA GPU present):
+
+```
+llama_prepare_model_devices: using device Vulkan0 (AMD Radeon 780M Graphics) - 7688 MiB free
+load_tensors: offloaded 29/29 layers to GPU
+Local inference backend/device(s) reported by llama.cpp:
+  0 = AMD Radeon 780M Graphics (Vulkan), 1 = NVIDIA GeForce RTX 5050 Laptop GPU (Vulkan),
+  2 = AMD Ryzen 7 250 w/ Radeon 780M Graphics (CPU) -- pinned to AMD device #0
+
+Generated 40 tokens in 1.82s -- 21.93 tok/s (measured, real GPU dispatch via Vulkan)
+```
+
+**Honest caveat this required fixing, not hiding:** this dev machine
+has two Vulkan-visible GPUs (the AMD iGPU and a discrete NVIDIA GPU).
+llama.cpp's default device picker chooses whichever reports more free
+VRAM -- on first measurement that silently selected the NVIDIA GPU, not
+the AMD one this feature exists to demonstrate. `local_llm.rs` now
+explicitly enumerates Vulkan devices, finds the one whose description
+matches "AMD"/"Radeon", and pins to it via `LlamaModelParams::with_devices`
+-- so this always exercises the AMD GPU specifically, on this machine or
+any other with a similar hybrid-graphics setup. The reported
+backend/device summary above is real llama.cpp output, not a hardcoded
+claim, so a run that silently fell back to CPU or a different GPU would
+show that instead.
 
 ### GPU-batched bootstrap confidence intervals
 
