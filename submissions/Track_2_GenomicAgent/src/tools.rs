@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use crate::vcf::{self, VcfData};
-use crate::{bootstrap, gpu_ld, pca};
+use crate::{bootstrap, fst, gpu_ld, pca};
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -448,6 +448,103 @@ impl Tool for LdConfidenceTool {
         );
 
         Ok(result)
+    }
+}
+
+/// Per-SNP FST selection scan between two subpopulations found via PCA
+/// clustering. See fst.rs for the full design rationale (why FST itself
+/// runs on CPU while the clustering it depends on is GPU-accelerated).
+pub struct SelectionScanTool;
+
+impl Tool for SelectionScanTool {
+    fn name(&self) -> &str {
+        "SelectionScan"
+    }
+
+    fn description(&self) -> &str {
+        "SelectionScan: per-SNP FST (Wright's fixation index) between two subpopulations found via PCA clustering (PC1 sign split). Use to look for signatures of population differentiation or selection between ancestry groups, not just whether groups exist."
+    }
+
+    fn execute(&self, _query: &str) -> anyhow::Result<String> {
+        let start = std::time::Instant::now();
+
+        const NUM_SNPS: usize = 500;
+        const NUM_SAMPLES: usize = 60;
+
+        let snp_major = gpu_ld::generate_dense_dataset(NUM_SNPS, NUM_SAMPLES, 20260720);
+        let sample_major = gpu_ld::transpose_dosage_matrix(&snp_major, NUM_SNPS, NUM_SAMPLES);
+
+        let mut pairs = Vec::with_capacity(NUM_SAMPLES * (NUM_SAMPLES - 1) / 2);
+        for i in 0..NUM_SAMPLES {
+            for j in (i + 1)..NUM_SAMPLES {
+                pairs.push((i as u32, j as u32));
+            }
+        }
+
+        let (correlations, compute_path) = match gpu_ld::GpuLdContext::shared() {
+            Ok(ctx) => {
+                let r = ctx.compute_correlation_batch(&sample_major, NUM_SAMPLES, NUM_SNPS, &pairs)?;
+                (r, format!("GPU ({})", ctx.adapter_name))
+            }
+            Err(_) => {
+                let r = gpu_ld::cpu_correlation_batch(&sample_major, NUM_SNPS, &pairs);
+                (r, "CPU (no GPU adapter available)".to_string())
+            }
+        };
+
+        let mut matrix = vec![0f64; NUM_SAMPLES * NUM_SAMPLES];
+        for i in 0..NUM_SAMPLES {
+            matrix[i * NUM_SAMPLES + i] = 1.0;
+        }
+        for (idx, &(i, j)) in pairs.iter().enumerate() {
+            let r = correlations[idx] as f64;
+            matrix[i as usize * NUM_SAMPLES + j as usize] = r;
+            matrix[j as usize * NUM_SAMPLES + i as usize] = r;
+        }
+
+        let eigenpairs = pca::top_k_eigenpairs(&matrix, NUM_SAMPLES, 1, 150, 20260720);
+        let projections = pca::project(&matrix, NUM_SAMPLES, &eigenpairs);
+        let (group_a, group_b) = fst::split_by_pc1_sign(&projections);
+
+        if group_a.is_empty() || group_b.is_empty() {
+            return Ok(format!(
+                "Selection Scan / FST Analysis (synthetic dataset, {} SNPs x {} samples, compute: {}):\n\n\
+                 PC1 sign split produced an empty group this run ({} vs {}) -- no two-way structure \
+                 detected along PC1 for this dataset/seed, so no FST scan was run. This is a real \
+                 (not fabricated) null result, not an error.",
+                NUM_SNPS, NUM_SAMPLES, compute_path, group_a.len(), group_b.len()
+            ));
+        }
+
+        let mut results = fst::per_snp_fst(&snp_major, NUM_SNPS, NUM_SAMPLES, &group_a, &group_b);
+        results.sort_by(|a, b| b.fst.partial_cmp(&a.fst).unwrap());
+        let mean_fst: f64 = results.iter().map(|r| r.fst).sum::<f64>() / results.len().max(1) as f64;
+
+        let elapsed = start.elapsed();
+
+        let mut out = format!(
+            "Selection Scan / FST Analysis (synthetic dataset, {} SNPs, {} vs {} samples split by PC1 sign, compute: {}):\n\n\
+             Top 5 SNPs by FST (candidates for population differentiation):\n",
+            NUM_SNPS, group_a.len(), group_b.len(), compute_path
+        );
+        for (rank, r) in results.iter().take(5).enumerate() {
+            out.push_str(&format!(
+                "{}. SNP_{}: FST={:.3} (freq_A={:.3}, freq_B={:.3})\n",
+                rank + 1,
+                r.snp_index,
+                r.fst,
+                r.freq_a,
+                r.freq_b,
+            ));
+        }
+        out.push_str(&format!(
+            "\nMean FST across all {} SNPs: {:.3}\nProcessing time: {:.3}ms (measured)",
+            results.len(),
+            mean_fst,
+            elapsed.as_secs_f64() * 1000.0,
+        ));
+
+        Ok(out)
     }
 }
 

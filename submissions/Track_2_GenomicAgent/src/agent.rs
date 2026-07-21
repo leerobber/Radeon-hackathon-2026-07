@@ -58,7 +58,9 @@ impl GenomicAgent {
     }
 
     fn route_to_tool(&self, _tools: &[String], query: &str) -> String {
-        if query.contains("confiden") || query.contains("bootstrap") || query.contains("certain") || query.contains("reliable") {
+        if query.contains("selection") || query.contains("FST") || query.contains("differentiation") {
+            "Using SelectionScan tool (per-SNP FST) to look for population differentiation.".to_string()
+        } else if query.contains("confiden") || query.contains("bootstrap") || query.contains("certain") || query.contains("reliable") {
             "Using LdConfidence tool (GPU-batched bootstrap) to quantify estimate uncertainty.".to_string()
         } else if query.contains("population") || query.contains("ancestry") || query.contains("PCA") || query.contains("structure") {
             "Using PopulationStructure tool (GPU-accelerated PCA) to analyze ancestry patterns.".to_string()

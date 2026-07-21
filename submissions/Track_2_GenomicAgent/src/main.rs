@@ -6,6 +6,7 @@ mod gpu_ld;
 mod pca;
 mod llm;
 mod bootstrap;
+mod fst;
 
 use agent::GenomicAgent;
 use tools::ToolRegistry;
@@ -35,6 +36,7 @@ fn main() -> anyhow::Result<()> {
     registry.register(Box::new(tools::HaplotypeToolTool));
     registry.register(Box::new(tools::PopulationStructureTool));
     registry.register(Box::new(tools::LdConfidenceTool));
+    registry.register(Box::new(tools::SelectionScanTool));
 
     let mut agent = GenomicAgent::new(registry);
 
@@ -44,6 +46,7 @@ fn main() -> anyhow::Result<()> {
         "Find haplotype patterns for variants with MAF > 0.05",
         "Run population structure PCA to check for ancestry clustering",
         "How confident are we in the strongest LD estimate -- give a bootstrap confidence interval",
+        "Run a selection scan for FST differentiation between ancestry clusters",
     ];
 
     for query in queries {
@@ -67,6 +70,7 @@ fn fast_mode() -> anyhow::Result<()> {
     registry.register(Box::new(tools::HaplotypeToolTool));
     registry.register(Box::new(tools::PopulationStructureTool));
     registry.register(Box::new(tools::LdConfidenceTool));
+    registry.register(Box::new(tools::SelectionScanTool));
 
     let mut agent = GenomicAgent::new(registry);
 
@@ -76,12 +80,14 @@ fn fast_mode() -> anyhow::Result<()> {
         "Find haplotype patterns for variants with MAF > 0.05",
         "Run population structure PCA to check for ancestry clustering",
         "How confident are we in the strongest LD estimate -- give a bootstrap confidence interval",
+        "Run a selection scan for FST differentiation between ancestry clusters",
     ];
 
+    let n = queries.len();
     for query in queries {
         let _response = agent.process_query_offline(query)?;
     }
 
-    println!("✓ 3 queries processed in ultra-fast mode");
+    println!("✓ {n} queries processed in ultra-fast mode");
     Ok(())
 }
