@@ -538,6 +538,19 @@ variance, both well above the synthetic dataset's typical values).
 
 ---
 
+## 8.5. Interactive showcase (optional, supplementary)
+
+`showcase.html` is a self-contained, animated companion page -- open it
+directly in any browser (no server needed). Real measured numbers
+animate in as you scroll, the architecture diagram is interactive
+(toggle GPU/CPU path, hover a node for what it does), and the "honesty"
+section is a set of flip cards pairing each thing this project doesn't
+claim with what's verified instead. It's a supplementary presentation
+asset, not a source of new claims -- every number on it is the same
+one already measured and cited elsewhere in this README.
+
+---
+
 ## 9. Troubleshooting
 
 **"Rust not found"** — Install from https://rustup.rs/, verify with `rustc --version`.
