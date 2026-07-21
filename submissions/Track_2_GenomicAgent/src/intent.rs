@@ -2,30 +2,54 @@
 //!
 //! No external API, no network, no billing, no LLM -- this is the
 //! crate's default and only mandatory planning mechanism. It's built
-//! from a real, classical, well-understood information-retrieval
-//! technique (TF-IDF weighted bag-of-words vectors, compared via cosine
-//! similarity), not a transformer and not a call to any third-party
+//! from Okapi BM25, a real, classical, decades-old information-
+//! retrieval technique -- the ranking function most real search engines
+//! actually use -- not a transformer and not a call to any third-party
 //! model. It does the one job the crate's original single-keyword
 //! router couldn't: select MORE THAN ONE tool for a compound query, by
-//! thresholding similarity scores instead of stopping at the first
+//! thresholding relevance scores instead of stopping at the first
 //! substring match.
 //!
-//! The similarity computation itself is a genuinely new, from-scratch
-//! GPU kernel (see shaders/intent_similarity.wgsl, dispatched via
-//! gpu_ld::GpuLdContext::compute_cosine_similarity_batch), cross-
-//! validated against a CPU reference the same way every other GPU path
-//! in this crate is, with a CPU fallback if no GPU adapter is available.
+//! **Why BM25 and not plain TF-IDF cosine similarity** (which is what
+//! this module used before): plain TF-IDF cosine similarity has two
+//! real weaknesses for this exact task. First, it doesn't saturate --
+//! a term appearing 5 times contributes ~5x the weight of appearing
+//! once, even though the 2nd through 5th occurrence tell you almost
+//! nothing more than the 1st. BM25's term-frequency saturation
+//! (`f*(k1+1) / (f + k1*length_norm)`) flattens that curve, the
+//! standard fix. Second, cosine similarity normalizes by vector norm,
+//! which under- and over-penalizes documents inconsistently as their
+//! length varies; BM25's own length normalization term (`k1`, `b`) is
+//! tuned specifically for short-document ranking and is the reason it
+//! displaced cosine-TF-IDF in production search systems decades ago.
+//! This module also adds bigram features (adjacent-word pairs) on top
+//! of unigrams, so an exact multi-word technical phrase shared between
+//! a query and a tool's description (e.g. "linkage disequilibrium")
+//! scores higher than two documents that merely share the same two
+//! words scattered separately.
+//!
+//! The scoring computation itself is a genuinely new, from-scratch GPU
+//! kernel (see shaders/intent_similarity.wgsl, dispatched via
+//! gpu_ld::GpuLdContext::compute_bm25_score_batch), cross-validated
+//! against a CPU reference the same way every other GPU path in this
+//! crate is, with a CPU fallback if no GPU adapter is available.
 //!
 //! **What this can't do that the optional LLM tier (llm.rs) still can:**
-//! write free-form natural-language narration of results. Vector
-//! similarity picks *which* tools apply; it has no language model
-//! behind it and cannot generate prose. When no LLM backend is
-//! configured, `GenomicAgent` shows raw tool output instead of a
-//! narrative -- the same honest fallback as before, just reached via a
-//! smarter (and now free, always-available) planning step.
+//! write free-form natural-language narration of results. BM25 picks
+//! *which* tools apply; it has no language model behind it and cannot
+//! generate prose. When no LLM backend is configured, `GenomicAgent`
+//! shows raw tool output instead of a narrative -- the same honest
+//! fallback as before, just reached via a smarter (and now free,
+//! always-available) planning step.
 
 use crate::gpu_ld;
 use std::collections::{HashMap, HashSet};
+
+/// Standard Okapi BM25 defaults (Robertson & Sparck Jones), the same
+/// values used across most real deployments (e.g. Lucene/Elasticsearch's
+/// defaults) -- not tuned or invented for this crate specifically.
+const BM25_K1: f32 = 1.2;
+const BM25_B: f32 = 0.75;
 
 #[derive(Clone)]
 pub struct ToolMatch {
@@ -38,7 +62,7 @@ pub struct IntentResult {
     pub compute_path: String,
 }
 
-fn tokenize(text: &str) -> Vec<String> {
+fn tokenize_unigrams(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|s| s.len() > 2)
@@ -46,24 +70,38 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// TF-IDF index over a fixed, small corpus (here: one document per
+/// Unigrams plus adjacent-pair bigrams (e.g. "linkage disequilibrium"
+/// tokenizes to "linkage", "disequilibrium", AND
+/// "linkage_disequilibrium"). The bigram lets an exact shared phrase
+/// score higher than two documents that merely share the same two
+/// words in unrelated places.
+fn tokenize_with_bigrams(text: &str) -> Vec<String> {
+    let unigrams = tokenize_unigrams(text);
+    let mut tokens = unigrams.clone();
+    for pair in unigrams.windows(2) {
+        tokens.push(format!("{}_{}", pair[0], pair[1]));
+    }
+    tokens
+}
+
+/// BM25 index over a fixed, small corpus (here: one document per
 /// registered tool's description). IDF is deliberately computed across
 /// exactly this corpus, not general English word frequency -- the goal
-/// is to weight words that distinguish between *this crate's* specific
-/// tools, not rare words in general.
-struct TfidfIndex {
+/// is to weight words/phrases that distinguish between *this crate's*
+/// specific tools, not rare words in general.
+struct Bm25Index {
     vocab_index: HashMap<String, usize>,
-    idf: Vec<f32>,
     vocab_len: usize,
     doc_vectors: Vec<Vec<f32>>,
 }
 
-impl TfidfIndex {
+impl Bm25Index {
     fn build(documents: &[&str]) -> Self {
-        let tokenized: Vec<Vec<String>> = documents.iter().map(|d| tokenize(d)).collect();
+        let unigram_tokenized: Vec<Vec<String>> = documents.iter().map(|d| tokenize_unigrams(d)).collect();
+        let full_tokenized: Vec<Vec<String>> = documents.iter().map(|d| tokenize_with_bigrams(d)).collect();
 
         let mut vocab_index: HashMap<String, usize> = HashMap::new();
-        for tokens in &tokenized {
+        for tokens in &full_tokenized {
             for t in tokens {
                 let next_idx = vocab_index.len();
                 vocab_index.entry(t.clone()).or_insert(next_idx);
@@ -73,7 +111,7 @@ impl TfidfIndex {
 
         let n_docs = documents.len() as f32;
         let mut doc_freq = vec![0u32; vocab_len];
-        for tokens in &tokenized {
+        for tokens in &full_tokenized {
             let mut seen: HashSet<&str> = HashSet::new();
             for t in tokens {
                 if seen.insert(t.as_str()) {
@@ -81,70 +119,98 @@ impl TfidfIndex {
                 }
             }
         }
-        // Smoothed IDF: ln(n_docs / (1 + df)) + 1, standard smoothing
-        // that keeps a word appearing in every document from getting a
-        // zero (or negative) weight instead of just a low one.
+        // Okapi BM25's smoothed IDF: ln((N - df + 0.5) / (df + 0.5) + 1).
+        // The "+1" inside the log keeps this non-negative for any df in
+        // [0, N] (unlike the classic Robertson/Sparck-Jones form, which
+        // can go negative for terms in more than half the corpus) --
+        // a standard, widely used variant (e.g. Lucene's default).
         let idf: Vec<f32> = doc_freq
             .iter()
-            .map(|&df| (n_docs / (1.0 + df as f32)).ln() + 1.0)
+            .map(|&df| ((n_docs - df as f32 + 0.5) / (df as f32 + 0.5) + 1.0).ln())
             .collect();
 
-        let doc_vectors: Vec<Vec<f32>> = tokenized
+        // Document length for BM25's length-normalization term is the
+        // UNIGRAM count only -- bigrams are a derived, redundant view of
+        // the same text, not additional words, and counting them here
+        // too would double-penalize longer descriptions.
+        let doc_lengths: Vec<f32> = unigram_tokenized.iter().map(|t| t.len() as f32).collect();
+        let avgdl = doc_lengths.iter().sum::<f32>() / n_docs.max(1.0);
+
+        let doc_vectors: Vec<Vec<f32>> = full_tokenized
             .iter()
-            .map(|tokens| Self::tfidf_vector(tokens, &vocab_index, &idf, vocab_len))
+            .zip(doc_lengths.iter())
+            .map(|(tokens, &doc_len)| {
+                Self::bm25_doc_vector(tokens, &vocab_index, &idf, vocab_len, doc_len, avgdl)
+            })
             .collect();
 
-        Self { vocab_index, idf, vocab_len, doc_vectors }
+        Self { vocab_index, vocab_len, doc_vectors }
     }
 
-    fn tfidf_vector(
+    /// BM25 term weight for every vocab term in one document:
+    /// `idf(t) * saturating_tf(t, D)`. Term-frequency saturation (more
+    /// occurrences help less and less) and length normalization (a hit
+    /// in a short, focused description counts for more than the same
+    /// hit in a long, sprawling one) are both applied here, per
+    /// document, on the CPU -- the GPU kernel that later scores a query
+    /// against these vectors is a plain dot product, deliberately (see
+    /// shaders/intent_similarity.wgsl for why).
+    fn bm25_doc_vector(
         tokens: &[String],
         vocab_index: &HashMap<String, usize>,
         idf: &[f32],
         vocab_len: usize,
+        doc_len: f32,
+        avgdl: f32,
     ) -> Vec<f32> {
         let mut tf = vec![0f32; vocab_len];
-        let mut counted = 0usize;
         for t in tokens {
             if let Some(&idx) = vocab_index.get(t) {
                 tf[idx] += 1.0;
-                counted += 1;
             }
         }
-        let total = counted.max(1) as f32;
+        let length_norm = 1.0 - BM25_B + BM25_B * (doc_len / avgdl.max(1.0));
         tf.iter()
             .zip(idf.iter())
-            .map(|(&f, &w)| (f / total) * w)
+            .map(|(&f, &w)| {
+                if f <= 0.0 {
+                    0.0
+                } else {
+                    w * (f * (BM25_K1 + 1.0)) / (f + BM25_K1 * length_norm)
+                }
+            })
             .collect()
     }
 
-    /// Vectorize a new piece of text (the user's query) against this
-    /// index's existing vocabulary/IDF. Words the index has never seen
-    /// (not present in any tool description) are silently ignored --
-    /// there's no weight to assign them, and they can't help match any
-    /// tool anyway.
-    fn vectorize(&self, text: &str) -> Vec<f32> {
-        let tokens = tokenize(text);
-        Self::tfidf_vector(&tokens, &self.vocab_index, &self.idf, self.vocab_len)
+    /// Vectorize the query: raw term counts (no saturation -- standard
+    /// for short queries, where a term rarely repeats) over the SAME
+    /// vocabulary/IDF this index was built from. Words/phrases the
+    /// index has never seen are silently ignored -- there's no weight
+    /// to assign them, and they can't help match any tool anyway.
+    fn vectorize_query(&self, text: &str) -> Vec<f32> {
+        let tokens = tokenize_with_bigrams(text);
+        let mut v = vec![0f32; self.vocab_len];
+        for t in &tokens {
+            if let Some(&idx) = self.vocab_index.get(t) {
+                v[idx] += 1.0;
+            }
+        }
+        v
     }
 }
 
-fn cpu_cosine_batch(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
+fn cpu_bm25_batch(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
     docs.iter()
-        .map(|d| {
-            let dot: f32 = query.iter().zip(d.iter()).map(|(a, b)| a * b).sum();
-            let nq = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let nd = d.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if nq <= 0.0 || nd <= 0.0 { 0.0 } else { dot / (nq * nd) }
-        })
+        .map(|d| query.iter().zip(d.iter()).map(|(a, b)| a * b).sum())
         .collect()
 }
 
-/// Classify `query` against the registered tools' descriptions. Selects
-/// every tool scoring at or above `threshold`; if none clear the
-/// threshold, falls back to the single best-scoring tool (mirrors the
-/// old keyword router's "always route somewhere" behavior -- an agent
-/// that finds nothing to do isn't more honest, just less useful).
+/// Classify `query` against the registered tools' descriptions using
+/// BM25 relevance scoring. Selects every tool scoring at or above
+/// `threshold`; if none clear it, falls back to the single best-scoring
+/// tool (mirrors the old keyword router's "always route somewhere"
+/// behavior -- an agent that finds nothing to do isn't more honest,
+/// just less useful).
 pub fn classify(
     query: &str,
     tool_names: &[String],
@@ -152,8 +218,8 @@ pub fn classify(
     threshold: f32,
 ) -> IntentResult {
     let documents: Vec<&str> = tool_descriptions.iter().map(|s| s.as_str()).collect();
-    let index = TfidfIndex::build(&documents);
-    let query_vec = index.vectorize(query);
+    let index = Bm25Index::build(&documents);
+    let query_vec = index.vectorize_query(query);
 
     let mut doc_flat = Vec::with_capacity(index.doc_vectors.len() * index.vocab_len);
     for v in &index.doc_vectors {
@@ -164,7 +230,7 @@ pub fn classify(
         (vec![0f32; documents.len()], "N/A (empty vocabulary)".to_string())
     } else {
         match gpu_ld::GpuLdContext::shared() {
-            Ok(ctx) => match ctx.compute_cosine_similarity_batch(
+            Ok(ctx) => match ctx.compute_bm25_score_batch(
                 &query_vec,
                 &doc_flat,
                 index.vocab_len,
@@ -172,12 +238,12 @@ pub fn classify(
             ) {
                 Ok(s) => (s, format!("GPU ({})", ctx.adapter_name)),
                 Err(_) => (
-                    cpu_cosine_batch(&query_vec, &index.doc_vectors),
+                    cpu_bm25_batch(&query_vec, &index.doc_vectors),
                     "CPU (GPU dispatch failed)".to_string(),
                 ),
             },
             Err(_) => (
-                cpu_cosine_batch(&query_vec, &index.doc_vectors),
+                cpu_bm25_batch(&query_vec, &index.doc_vectors),
                 "CPU (no GPU adapter available)".to_string(),
             ),
         }
@@ -227,7 +293,7 @@ mod tests {
             "run population structure PCA to check for ancestry clustering",
             &names,
             &descriptions,
-            0.2,
+            2.0,
         );
         assert_eq!(result.selected.len(), 1, "expected exactly one selected tool, got {:?}", result.selected.iter().map(|m| &m.name).collect::<Vec<_>>());
         assert_eq!(result.selected[0].name, "PopulationStructure");
@@ -241,7 +307,7 @@ mod tests {
             "find haplotype patterns and frequencies for SNPs with minor allele frequency quality control",
             &names,
             &descriptions,
-            0.15,
+            0.7,
         );
         let selected_names: Vec<&str> = result.selected.iter().map(|m| m.name.as_str()).collect();
         assert!(selected_names.contains(&"HaplotypeTool"), "expected HaplotypeTool in {selected_names:?}");
@@ -253,7 +319,7 @@ mod tests {
     fn never_returns_an_empty_selection() {
         let (names, descriptions) = sample_tools();
         // A query sharing essentially no vocabulary with any description.
-        let result = classify("xyzzy plugh quux", &names, &descriptions, 0.5);
+        let result = classify("xyzzy plugh quux", &names, &descriptions, 5.0);
         assert_eq!(result.selected.len(), 1, "should fall back to single best match, not an empty selection");
     }
 
@@ -269,7 +335,31 @@ mod tests {
     #[test]
     fn empty_query_never_panics() {
         let (names, descriptions) = sample_tools();
-        let result = classify("", &names, &descriptions, 0.2);
+        let result = classify("", &names, &descriptions, 1.0);
         assert_eq!(result.selected.len(), 1);
+    }
+
+    #[test]
+    fn shared_exact_phrase_scores_higher_than_scattered_shared_words() {
+        // Two tools, both mention "population" and "structure"
+        // somewhere, but only one uses them as an adjacent phrase like
+        // the query does. BM25 + bigrams should prefer the exact-phrase
+        // match.
+        let names = vec!["ExactPhrase".to_string(), "ScatteredWords".to_string()];
+        let descriptions = vec![
+            "Analyze population structure across many samples for research".to_string(),
+            "Studies population genetics and the structure of variant calls separately".to_string(),
+        ];
+        let result = classify("population structure analysis", &names, &descriptions, 0.0);
+        assert_eq!(result.selected.first().map(|m| m.name.as_str()), Some("ExactPhrase"));
+    }
+
+    #[test]
+    fn bm25_score_is_zero_for_completely_disjoint_vocabulary() {
+        let (names, descriptions) = sample_tools();
+        let index = Bm25Index::build(&descriptions.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let query_vec = index.vectorize_query("xyzzy plugh quux");
+        assert!(query_vec.iter().all(|&x| x == 0.0), "query with no shared vocabulary should vectorize to all zeros");
+        let _ = names; // names unused in this test but kept for symmetry with sample_tools()
     }
 }

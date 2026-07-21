@@ -1,18 +1,25 @@
-// Cosine similarity between one TF-IDF query vector and N tool-description
-// document vectors. This is the entire "which tool(s) does this query
+// Dot product between one BM25 query-term vector and N tool-description
+// document vectors, each already BM25-weighted on the CPU side (see
+// src/intent.rs). This is the entire "which tool(s) does this query
 // need" decision for this crate's default (no-API, no-network, no-cost)
-// planning path -- see src/intent.rs for the vectorization that builds
-// these vectors and src/agent.rs for how the scores are thresholded into
-// a tool selection. Not a transformer, not an external model: a from-
+// planning path. Not a transformer, not an external model: a from-
 // scratch kernel implementing a classical, well-understood technique
-// (bag-of-words / TF-IDF + cosine similarity, standard in information
-// retrieval), dispatched to real GPU hardware.
+// (Okapi BM25, standard in information retrieval -- what most real
+// search engines use), dispatched to real GPU hardware.
 //
-// One GPU thread per document. Recomputes the query's own norm once per
-// thread rather than once total -- wasteful in the abstract, but the
-// actual workload here (one query vector against a handful of tool
-// descriptions, vocab size in the tens of words) is small enough that
-// this doesn't matter in practice; kept simple and auditable over
+// This is intentionally a raw dot product, not cosine similarity: BM25
+// is not a normalized/angular measure the way cosine similarity is --
+// its term-frequency saturation and document-length normalization
+// (both applied when the document vector's weights were computed, not
+// here) already serve the role vector-norm division would in a cosine
+// scheme. Dividing by vector norms on top of that would double up on
+// length normalization and distort the ranking BM25 is designed to
+// produce.
+//
+// One GPU thread per document. Workload here (one query vector against
+// a handful of tool descriptions, vocab size in the low hundreds once
+// bigrams are included) is small enough that per-thread simplicity
+// matters more than shaving cycles -- kept simple and auditable over
 // maximally efficient, same tradeoff philosophy as the rest of this
 // crate's GPU code.
 
@@ -36,22 +43,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let base = doc_idx * params.vocab_len;
-    var dot: f32 = 0.0;
-    var norm_q: f32 = 0.0;
-    var norm_d: f32 = 0.0;
+    var score: f32 = 0.0;
 
     for (var t: u32 = 0u; t < params.vocab_len; t = t + 1u) {
-        let q = query_vec[t];
-        let d = doc_vectors[base + t];
-        dot = dot + q * d;
-        norm_q = norm_q + q * q;
-        norm_d = norm_d + d * d;
+        score = score + query_vec[t] * doc_vectors[base + t];
     }
 
-    let denom = sqrt(norm_q) * sqrt(norm_d);
-    if (denom <= 0.0) {
-        out_scores[doc_idx] = 0.0;
-    } else {
-        out_scores[doc_idx] = dot / denom;
-    }
+    out_scores[doc_idx] = score;
 }

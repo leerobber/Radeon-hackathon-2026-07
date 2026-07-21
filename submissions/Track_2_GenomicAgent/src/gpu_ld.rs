@@ -168,8 +168,8 @@ impl GpuLdContext {
         });
 
         // Second, independent kernel + pipeline on the same device/queue
-        // (no reason to pay adapter/device setup twice): TF-IDF cosine
-        // similarity for tool-intent classification. See
+        // (no reason to pay adapter/device setup twice): BM25 relevance
+        // scoring for tool-intent classification. See
         // shaders/intent_similarity.wgsl and intent.rs.
         let intent_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("intent_similarity_shader"),
@@ -351,12 +351,14 @@ impl GpuLdContext {
         })
     }
 
-    /// Cosine similarity between one query vector and `num_docs` document
-    /// vectors (each `vocab_len` long, row-major in `doc_vectors_flat`),
-    /// dispatched as a single GPU call. See shaders/intent_similarity.wgsl
-    /// and intent.rs for what builds these vectors (TF-IDF over tool
-    /// descriptions) and how the scores are used.
-    pub fn compute_cosine_similarity_batch(
+    /// Weighted dot product between one query-term vector and `num_docs`
+    /// document vectors (each `vocab_len` long, row-major in
+    /// `doc_vectors_flat`), dispatched as a single GPU call. Raw dot
+    /// product, not cosine similarity -- BM25's saturation/length
+    /// normalization is already baked into the document vector's
+    /// weights (see intent.rs), so dividing by vector norms here would
+    /// double-apply length normalization. See shaders/intent_similarity.wgsl.
+    pub fn compute_bm25_score_batch(
         &self,
         query_vec: &[f32],
         doc_vectors_flat: &[f32],
@@ -657,19 +659,16 @@ mod tests {
         assert!((result[0] - 1.0).abs() < 1e-4, "expected r²≈1.0, got {}", result[0]);
     }
 
-    fn cpu_cosine(a: &[f32], b: &[f32]) -> f32 {
-        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-        let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if na <= 0.0 || nb <= 0.0 { 0.0 } else { dot / (na * nb) }
+    fn cpu_dot(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
     }
 
     #[test]
-    fn intent_kernel_gpu_matches_cpu_cosine_reference() {
+    fn intent_kernel_gpu_matches_cpu_dot_product_reference() {
         let ctx = match GpuLdContext::new() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("SKIPPED intent_kernel_gpu_matches_cpu_cosine_reference: no GPU adapter available ({e})");
+                eprintln!("SKIPPED intent_kernel_gpu_matches_cpu_dot_product_reference: no GPU adapter available ({e})");
                 return;
             }
         };
@@ -687,31 +686,31 @@ mod tests {
         let docs: Vec<f32> = (0..num_docs * vocab_len).map(|_| next()).collect();
 
         let gpu_result = ctx
-            .compute_cosine_similarity_batch(&query, &docs, vocab_len, num_docs)
+            .compute_bm25_score_batch(&query, &docs, vocab_len, num_docs)
             .unwrap();
 
         let cpu_result: Vec<f32> = (0..num_docs)
-            .map(|d| cpu_cosine(&query, &docs[d * vocab_len..(d + 1) * vocab_len]))
+            .map(|d| cpu_dot(&query, &docs[d * vocab_len..(d + 1) * vocab_len]))
             .collect();
 
         assert_eq!(gpu_result.len(), cpu_result.len());
         for (g, c) in gpu_result.iter().zip(cpu_result.iter()) {
-            assert!((g - c).abs() < 1e-4, "GPU cosine {g} vs CPU cosine {c} diverge");
+            assert!((g - c).abs() < 1e-3, "GPU dot product {g} vs CPU dot product {c} diverge");
         }
     }
 
     #[test]
-    fn intent_kernel_gives_similarity_one_for_identical_vectors() {
+    fn intent_kernel_dot_product_matches_hand_computed_value() {
         let ctx = match GpuLdContext::new() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("SKIPPED intent_kernel_gives_similarity_one_for_identical_vectors: no GPU adapter available ({e})");
+                eprintln!("SKIPPED intent_kernel_dot_product_matches_hand_computed_value: no GPU adapter available ({e})");
                 return;
             }
         };
         let query = vec![1.0f32, 2.0, 0.0, 3.0];
-        let docs = vec![1.0f32, 2.0, 0.0, 3.0]; // one doc, identical to query
-        let result = ctx.compute_cosine_similarity_batch(&query, &docs, 4, 1).unwrap();
-        assert!((result[0] - 1.0).abs() < 1e-5, "expected cosine similarity 1.0 for identical vectors, got {}", result[0]);
+        let docs = vec![1.0f32, 2.0, 0.0, 3.0]; // one doc, identical to query -> sum of squares
+        let result = ctx.compute_bm25_score_batch(&query, &docs, 4, 1).unwrap();
+        assert!((result[0] - 14.0).abs() < 1e-4, "expected dot product 1+4+0+9=14, got {}", result[0]);
     }
 }

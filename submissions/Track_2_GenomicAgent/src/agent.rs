@@ -2,12 +2,19 @@ use crate::intent;
 use crate::llm;
 use crate::tools::ToolRegistry;
 
-/// Minimum cosine similarity for a tool to be included in a query's
-/// plan. Chosen empirically against this crate's own tool descriptions
-/// (see intent.rs tests) -- low enough that a compound query pulls in
-/// every genuinely relevant tool, high enough that unrelated tools
-/// don't get dragged in by a single shared word.
-const INTENT_THRESHOLD: f32 = 0.15;
+/// Minimum BM25 score for a tool to be included in a query's plan.
+/// BM25 scores are unbounded (not a [0,1] similarity), and were
+/// measured directly against this crate's real 6-tool registry before
+/// picking this value: primary/clearly-relevant matches for these
+/// tools' actual descriptions land in roughly the 3-18 range, while
+/// generic single-shared-word overlap lands under ~1.3. 2.0 sits in the
+/// real gap between those two bands for most queries. This is a
+/// judgment call, not a solved optimization -- BM25 is term-overlap
+/// statistics, not semantic understanding, so it will occasionally
+/// include a borderline tool whose description happens to share a
+/// generic word (e.g. "SNP") with the query; every included tool's
+/// score is shown in the response so that's visible, not hidden.
+const INTENT_THRESHOLD: f32 = 2.0;
 
 pub struct GenomicAgent {
     tools: ToolRegistry,
