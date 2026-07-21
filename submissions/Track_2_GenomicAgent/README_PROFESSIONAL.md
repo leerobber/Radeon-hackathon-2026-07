@@ -10,8 +10,9 @@ entirely offline by default: a custom, from-scratch GPU kernel (TF-IDF
 API key, zero network call, zero billing risk required. An LLM backend
 is optional and only ever adds a plain-English narration on top of that
 — never decides which tools run. Also includes GPU-batched bootstrap
-confidence intervals and a per-SNP FST selection scan — see "Advanced
-capabilities" below for what's actually verified about each.
+confidence intervals, a per-SNP FST selection scan, and a real (not
+just synthetic) 1000 Genomes data mode — see "Advanced capabilities"
+and "About the data" below for what's actually verified about each.
 
 ---
 
@@ -218,7 +219,8 @@ Track_2_GenomicAgent/
 │   ├── tools.rs             # 6 genomic tools, real computation (see vcf.rs, pca.rs,
 │   │                          bootstrap.rs, fst.rs)
 │   ├── vcf.rs                # Synthetic VCF generation + real VCF-format parser +
-│   │                           real MAF/missingness/HWE/LD-r²/haplotype computation
+│   │                           real MAF/missingness/HWE/LD-r²/haplotype computation +
+│   │                           real 1000 Genomes data loader (GENOMIC_AGENT_REAL_DATA)
 │   ├── gpu_ld.rs              # Real GPU compute (wgpu), AMD-adapter-targeted,
 │   │                           cross-validated against CPU reference. LD/PCA
 │   │                           kernel + a second, independent intent-similarity
@@ -236,6 +238,9 @@ Track_2_GenomicAgent/
 │   │   ├── ld_r2.wgsl             # LD / population-structure correlation kernel
 │   │   └── intent_similarity.wgsl  # Tool-planning cosine-similarity kernel
 │   └── bench.rs                   # Real timing (Instant::now/elapsed) around real execution
+├── data/
+│   ├── real_1000genomes_chrMT_slice.vcf  # Real 1000 Genomes Phase 3 data (bundled)
+│   └── README.md                          # Exact provenance/derivation of that file
 ├── LICENSE
 ├── setup.sh / setup.bat
 └── README_PROFESSIONAL.md
@@ -245,11 +250,15 @@ Track_2_GenomicAgent/
 
 ## 8. What each tool does
 
+All six tools below default to a synthetic VCF (real VCF-format text,
+generated deterministically at runtime); set `GENOMIC_AGENT_REAL_DATA=1`
+and every one of them instead analyzes the real, bundled 1000 Genomes
+slice described in "About the data" further down this section.
+
 ### VcfAnalyzer
-Parses a synthetic VCF (real VCF-format text, generated deterministically
-at runtime, not a bundled real-patient file) and computes real per-variant
-statistics: SNP count, minor allele frequency, missingness, and a real
-Hardy-Weinberg equilibrium chi-square test per variant (flags SNPs at
+Parses the dataset (synthetic by default; see above) and computes real
+per-variant statistics: SNP count, minor allele frequency, missingness,
+and a real Hardy-Weinberg equilibrium chi-square test per variant (flags SNPs at
 p<0.001, the standard QC threshold for genotyping-error/stratification
 screening). The HWE p-value uses the exact df=1 identity that chi-square(1)
 is the square of a standard normal, not an approximation of the
@@ -296,17 +305,40 @@ population differentiation plus the mean FST across all SNPs. See
 CPU while the clustering it depends on is GPU-accelerated.
 
 ### About the data
-All tools currently analyze a synthetic dataset generated at runtime
-(`vcf::generate_synthetic_vcf` / `gpu_ld::generate_dense_dataset`), not a
-real 1000 Genomes or patient VCF file. The generators embed genuine
-structure via founder-haplotype resampling (nearby SNPs really are
-correlated, samples really do share latent ancestry signal depending on
-which founders they drew from -- the LD and PopulationStructure tools'
-job is to genuinely detect that, not report a hardcoded number) — but it
-is not real biological data, and the README says so rather than implying
-otherwise. Swapping in a real VCF file would only require pointing
-`load_dataset()` in `tools.rs` at a file-read instead of the generator;
-`parse_vcf()` already accepts arbitrary VCF-format text.
+
+**Two real data sources, chosen with one environment variable:**
+
+```bash
+cargo run --release                        # synthetic (default)
+GENOMIC_AGENT_REAL_DATA=1 cargo run --release   # real 1000 Genomes data
+```
+
+By default, all tools analyze a synthetic dataset generated at runtime
+(`vcf::generate_synthetic_vcf` / `gpu_ld::generate_dense_dataset`). The
+generators embed genuine structure via founder-haplotype resampling
+(nearby SNPs really are correlated, samples really do share latent
+ancestry signal depending on which founders they drew from -- the LD and
+PopulationStructure tools' job is to genuinely detect that, not report a
+hardcoded number) -- but it is not real biological data, and every tool's
+output says "synthetic dataset" rather than implying otherwise.
+
+Set `GENOMIC_AGENT_REAL_DATA=1` and every tool instead analyzes a real,
+bundled (compile-time `include_str!`, no runtime download or network
+access needed) subset of the 1000 Genomes Project Phase 3 mitochondrial
+genotype callset -- 300 real biallelic SNPs across 100 real samples, an
+official public release with no usage restrictions. See
+`data/README.md` for the complete, disclosed derivation (source URL,
+filtering criteria, and the haploid-to-diploid representation transform
+this crate's existing parser needed). Every tool's output says exactly
+which data source produced it, and `VcfAnalyzer` explicitly flags that
+Hardy-Weinberg testing isn't a meaningful QC signal for this haploid
+locus, rather than silently reporting a number that looks like a real
+test but isn't. On this real data, LD/haplotype/PCA structure is
+noticeably *stronger* than on the synthetic generator, as expected --
+real mtDNA has no recombination at all, so linkage and haplogroup
+signal along its length are genuinely large (e.g. a live run found a
+real 6-SNP LD block at `MT:10463-15607` and PC1 explaining ~20% of
+variance, both well above the synthetic dataset's typical values).
 
 ---
 

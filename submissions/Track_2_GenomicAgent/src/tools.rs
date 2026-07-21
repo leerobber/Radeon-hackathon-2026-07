@@ -8,14 +8,51 @@ pub trait Tool: Send + Sync {
     fn execute(&self, query: &str) -> anyhow::Result<String>;
 }
 
-/// Shared synthetic dataset generation. Same seed/size across tools so
-/// they're analyzing the same (clearly synthetic) cohort. Previously
-/// each tool ignored its input and returned a hardcoded canned string;
-/// this generates real VCF text and parses it with the real parser in
-/// `vcf.rs` every time a tool executes.
+/// Shared dataset loading. Same source across tools so they're analyzing
+/// the same cohort. Defaults to a deterministic synthetic dataset;
+/// set `GENOMIC_AGENT_REAL_DATA` to load the real, bundled 1000 Genomes
+/// mtDNA slice instead (see vcf.rs's `load_real_1000_genomes` and
+/// data/README.md for exactly what that is and how it was derived).
+/// Previously each tool ignored its input and returned a hardcoded
+/// canned string; this generates real VCF text and parses it with the
+/// real parser in `vcf.rs` every time a tool executes, either way.
 fn load_dataset() -> anyhow::Result<VcfData> {
-    let text = vcf::generate_synthetic_vcf(400, 40, 20260720);
-    vcf::parse_vcf(&text)
+    if vcf::use_real_data() {
+        vcf::load_real_1000_genomes()
+    } else {
+        let text = vcf::generate_synthetic_vcf(400, 40, 20260720);
+        vcf::parse_vcf(&text)
+    }
+}
+
+/// Human-readable label for the current data source, used in tool
+/// output so "synthetic dataset" never appears when real data was
+/// actually analyzed, or vice versa.
+fn dataset_label() -> &'static str {
+    if vcf::use_real_data() {
+        "real 1000 Genomes Phase 3 chrMT data, see data/README.md"
+    } else {
+        "synthetic dataset"
+    }
+}
+
+/// Dense SNP-major dosage matrix for the GPU-heavy tools
+/// (PopulationStructure, LdConfidence, SelectionScan). Real-data mode
+/// uses the bundled slice's actual size (300 SNPs x 100 samples) rather
+/// than `default_num_snps`/`default_num_samples` -- those defaults only
+/// apply to the synthetic generator, which can be asked for any size.
+fn load_snp_major_dense(
+    default_num_snps: usize,
+    default_num_samples: usize,
+    seed: u64,
+) -> anyhow::Result<(Vec<f32>, usize, usize)> {
+    if vcf::use_real_data() {
+        let data = vcf::load_real_1000_genomes()?;
+        vcf::to_dense_matrix(&data)
+    } else {
+        let dosages = gpu_ld::generate_dense_dataset(default_num_snps, default_num_samples, seed);
+        Ok((dosages, default_num_snps, default_num_samples))
+    }
 }
 
 pub struct VcfAnalyzerTool;
@@ -50,8 +87,8 @@ impl Tool for VcfAnalyzerTool {
 
         let elapsed = start.elapsed();
 
-        let result = format!(
-            "VCF Analysis Summary (synthetic dataset, {} samples):\n\
+        let mut result = format!(
+            "VCF Analysis Summary ({}, {} samples):\n\
              - Total SNPs: {}\n\
              - Common SNPs (MAF > 0.05): {}\n\
              - Rare SNPs (MAF <= 0.05): {}\n\
@@ -60,6 +97,7 @@ impl Tool for VcfAnalyzerTool {
              - Hardy-Weinberg QC: {}/{} SNPs tested, {} fail at p<0.001 (real chi-square test, df=1)\n\
              - Mean HWE chi-square: {:.3}\n\
              - Processing time: {:.3}ms (measured)",
+            dataset_label(),
             data.sample_names.len(),
             total_snps,
             common_snps,
@@ -72,6 +110,18 @@ impl Tool for VcfAnalyzerTool {
             mean_hwe_chi2,
             elapsed.as_secs_f64() * 1000.0,
         );
+
+        if vcf::use_real_data() {
+            result.push_str(
+                "\nNote: this is real mitochondrial DNA data, which is haploid \
+                 (uniparentally inherited, no recombination). Hardy-Weinberg \
+                 equilibrium assumes diploid biparental inheritance and isn't a \
+                 meaningful QC signal here -- heterozygous calls are structurally \
+                 impossible for a haploid locus, so the numbers above will trivially \
+                 show zero heterozygosity rather than testing anything real. Reported \
+                 for consistency with the synthetic-data path, not as a real QC result.",
+            );
+        }
 
         Ok(result)
     }
@@ -141,8 +191,8 @@ impl Tool for LdBlockTool {
         let elapsed = start.elapsed();
 
         let mut result = format!(
-            "Linkage Disequilibrium Analysis (synthetic dataset, real pairwise r², window={}):\n\n",
-            WINDOW
+            "Linkage Disequilibrium Analysis ({}, real pairwise r², window={}):\n\n",
+            dataset_label(), WINDOW
         );
         for (idx, members) in blocks.iter().take(5).enumerate() {
             let first = &data.variants[*members.iter().min().unwrap()];
@@ -222,8 +272,8 @@ impl Tool for HaplotypeToolTool {
         let elapsed = start.elapsed();
 
         let mut result = format!(
-            "Haplotype Patterns (synthetic dataset, {}-SNP window, {} phased haplotype observations):\n\n",
-            window_end, total_haps
+            "Haplotype Patterns ({}, {}-SNP window, {} phased haplotype observations):\n\n",
+            dataset_label(), window_end, total_haps
         );
         for (i, (pattern, count)) in ranked.iter().take(6).enumerate() {
             let freq = *count as f64 / total_haps.max(1) as f64;
@@ -273,31 +323,34 @@ impl Tool for PopulationStructureTool {
     fn execute(&self, _query: &str) -> anyhow::Result<String> {
         let start = std::time::Instant::now();
 
-        const NUM_SNPS: usize = 500;
-        const NUM_SAMPLES: usize = 60;
+        const DEFAULT_NUM_SNPS: usize = 500;
+        const DEFAULT_NUM_SAMPLES: usize = 60;
         const NUM_COMPONENTS: usize = 2;
 
         // Sample-major dosage matrix: each "row" is one sample's genotype
-        // vector across all SNPs. Reuses gpu_ld's founder-haplotype
-        // synthetic generator (real embedded structure), then transposes
-        // from the SNP-major layout that generator produces.
-        let snp_major = gpu_ld::generate_dense_dataset(NUM_SNPS, NUM_SAMPLES, 20260720);
-        let sample_major = gpu_ld::transpose_dosage_matrix(&snp_major, NUM_SNPS, NUM_SAMPLES);
+        // vector across all SNPs. Synthetic mode reuses gpu_ld's founder-
+        // haplotype generator (real embedded structure); real-data mode
+        // loads the bundled 1000 Genomes slice instead (see
+        // load_snp_major_dense), then either way transposes from the
+        // SNP-major layout into sample-major.
+        let (snp_major, num_snps, num_samples) =
+            load_snp_major_dense(DEFAULT_NUM_SNPS, DEFAULT_NUM_SAMPLES, 20260720)?;
+        let sample_major = gpu_ld::transpose_dosage_matrix(&snp_major, num_snps, num_samples);
 
-        let mut pairs = Vec::with_capacity(NUM_SAMPLES * (NUM_SAMPLES - 1) / 2);
-        for i in 0..NUM_SAMPLES {
-            for j in (i + 1)..NUM_SAMPLES {
+        let mut pairs = Vec::with_capacity(num_samples * (num_samples - 1) / 2);
+        for i in 0..num_samples {
+            for j in (i + 1)..num_samples {
                 pairs.push((i as u32, j as u32));
             }
         }
 
         let (correlations, compute_path) = match gpu_ld::GpuLdContext::shared() {
             Ok(ctx) => {
-                let r = ctx.compute_correlation_batch(&sample_major, NUM_SAMPLES, NUM_SNPS, &pairs)?;
+                let r = ctx.compute_correlation_batch(&sample_major, num_samples, num_snps, &pairs)?;
                 (r, format!("GPU ({}, AMD={})", ctx.adapter_name, ctx.adapter_is_amd))
             }
             Err(_) => {
-                let r = gpu_ld::cpu_correlation_batch(&sample_major, NUM_SNPS, &pairs);
+                let r = gpu_ld::cpu_correlation_batch(&sample_major, num_snps, &pairs);
                 (r, "CPU (no GPU adapter available)".to_string())
             }
         };
@@ -307,18 +360,18 @@ impl Tool for PopulationStructureTool {
         // is exactly 1.0 (a sample perfectly correlates with itself),
         // not computed -- computing self-correlation would divide by
         // zero variance in exactly the degenerate way you'd expect.
-        let mut matrix = vec![0f64; NUM_SAMPLES * NUM_SAMPLES];
-        for i in 0..NUM_SAMPLES {
-            matrix[i * NUM_SAMPLES + i] = 1.0;
+        let mut matrix = vec![0f64; num_samples * num_samples];
+        for i in 0..num_samples {
+            matrix[i * num_samples + i] = 1.0;
         }
         for (idx, &(i, j)) in pairs.iter().enumerate() {
             let r = correlations[idx] as f64;
-            matrix[i as usize * NUM_SAMPLES + j as usize] = r;
-            matrix[j as usize * NUM_SAMPLES + i as usize] = r;
+            matrix[i as usize * num_samples + j as usize] = r;
+            matrix[j as usize * num_samples + i as usize] = r;
         }
 
-        let eigenpairs = pca::top_k_eigenpairs(&matrix, NUM_SAMPLES, NUM_COMPONENTS, 150, 20260720);
-        let projections = pca::project(&matrix, NUM_SAMPLES, &eigenpairs);
+        let eigenpairs = pca::top_k_eigenpairs(&matrix, num_samples, NUM_COMPONENTS, 150, 20260720);
+        let projections = pca::project(&matrix, num_samples, &eigenpairs);
 
         // Bootstrap 95% CI on PC1's eigenvalue: how much would "how much
         // variance does PC1 explain" move if we'd sampled a slightly
@@ -331,8 +384,8 @@ impl Tool for PopulationStructureTool {
         const N_BOOTSTRAP: usize = 80;
         let pc1_ci = bootstrap::bootstrap_top_eigenvalue_ci(
             &sample_major,
-            NUM_SAMPLES,
-            NUM_SNPS,
+            num_samples,
+            num_snps,
             N_BOOTSTRAP,
             20260720,
         )
@@ -342,13 +395,13 @@ impl Tool for PopulationStructureTool {
         // since diagonal is all 1.0) equals the sum of ALL n eigenvalues
         // -- so % variance explained by a found component is exact, not
         // an approximation, even though only the top few were computed.
-        let total_variance = NUM_SAMPLES as f64;
+        let total_variance = num_samples as f64;
 
         let elapsed = start.elapsed();
 
         let mut result = format!(
-            "Population Structure Analysis (synthetic dataset, {} samples x {} SNPs, compute: {}):\n\n",
-            NUM_SAMPLES, NUM_SNPS, compute_path
+            "Population Structure Analysis ({}, {} samples x {} SNPs, compute: {}):\n\n",
+            dataset_label(), num_samples, num_snps, compute_path
         );
         for (i, ep) in eigenpairs.iter().enumerate() {
             result.push_str(&format!(
@@ -366,7 +419,7 @@ impl Tool for PopulationStructureTool {
             None => result.push_str("PC1 eigenvalue 95% bootstrap CI: unavailable this run\n"),
         }
         result.push_str("\nFirst 5 samples projected onto PC1/PC2:\n");
-        for i in 0..5.min(NUM_SAMPLES) {
+        for i in 0..5.min(num_samples) {
             result.push_str(&format!(
                 "  SAMPLE_{:03}: PC1={:.3}, PC2={:.3}\n",
                 i,
@@ -401,45 +454,46 @@ impl Tool for LdConfidenceTool {
     fn execute(&self, _query: &str) -> anyhow::Result<String> {
         let start = std::time::Instant::now();
 
-        const NUM_SNPS: usize = 200;
-        const NUM_SAMPLES: usize = 60;
+        const DEFAULT_NUM_SNPS: usize = 200;
+        const DEFAULT_NUM_SAMPLES: usize = 60;
         const WINDOW: usize = 20;
         const N_BOOTSTRAP: usize = 300;
 
-        let dosages = gpu_ld::generate_dense_dataset(NUM_SNPS, NUM_SAMPLES, 20260720);
-        let pairs = gpu_ld::windowed_pairs(NUM_SNPS, WINDOW);
+        let (dosages, num_snps, num_samples) =
+            load_snp_major_dense(DEFAULT_NUM_SNPS, DEFAULT_NUM_SAMPLES, 20260720)?;
+        let pairs = gpu_ld::windowed_pairs(num_snps, WINDOW);
 
         // Real point-estimate scan to find the strongest pair worth
         // putting a confidence interval on, rather than an arbitrary one.
         let (r2_values, compute_path) = match gpu_ld::GpuLdContext::shared() {
             Ok(ctx) => {
-                let r = ctx.compute_r2_batch(&dosages, NUM_SAMPLES, NUM_SNPS, &pairs)?;
+                let r = ctx.compute_r2_batch(&dosages, num_samples, num_snps, &pairs)?;
                 (r, format!("GPU ({})", ctx.adapter_name))
             }
-            Err(_) => (gpu_ld::cpu_r2_batch(&dosages, NUM_SAMPLES, &pairs), "CPU (no GPU adapter available)".to_string()),
+            Err(_) => (gpu_ld::cpu_r2_batch(&dosages, num_samples, &pairs), "CPU (no GPU adapter available)".to_string()),
         };
 
         let (best_idx, &best_r2) = r2_values
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .expect("windowed_pairs is non-empty for NUM_SNPS > WINDOW");
+            .expect("windowed_pairs is non-empty for num_snps > WINDOW");
         let (i, j) = pairs[best_idx];
 
-        let row_i = &dosages[i as usize * NUM_SAMPLES..(i as usize + 1) * NUM_SAMPLES];
-        let row_j = &dosages[j as usize * NUM_SAMPLES..(j as usize + 1) * NUM_SAMPLES];
-        let ci = bootstrap::bootstrap_r2_ci(row_i, row_j, NUM_SAMPLES, N_BOOTSTRAP, 20260720)?;
+        let row_i = &dosages[i as usize * num_samples..(i as usize + 1) * num_samples];
+        let row_j = &dosages[j as usize * num_samples..(j as usize + 1) * num_samples];
+        let ci = bootstrap::bootstrap_r2_ci(row_i, row_j, num_samples, N_BOOTSTRAP, 20260720)?;
 
         let elapsed = start.elapsed();
 
         let result = format!(
-            "LD Confidence Interval (synthetic dataset, {} SNPs x {} samples, window={}, compute: {}):\n\n\
+            "LD Confidence Interval ({}, {} SNPs x {} samples, window={}, compute: {}):\n\n\
              Strongest pair in window scan: SNP_{} <-> SNP_{}\n\
              Point estimate r²: {:.3} (matches bootstrap point estimate: {:.3})\n\
              95% bootstrap CI: [{:.3}, {:.3}] ({} resamples)\n\
              Pairs scanned: {}\n\
              Processing time: {:.3}ms (measured)",
-            NUM_SNPS, NUM_SAMPLES, WINDOW, compute_path,
+            dataset_label(), num_snps, num_samples, WINDOW, compute_path,
             i, j,
             best_r2, ci.point_estimate,
             ci.ci_low, ci.ci_high, ci.n_replicates,
@@ -468,64 +522,65 @@ impl Tool for SelectionScanTool {
     fn execute(&self, _query: &str) -> anyhow::Result<String> {
         let start = std::time::Instant::now();
 
-        const NUM_SNPS: usize = 500;
-        const NUM_SAMPLES: usize = 60;
+        const DEFAULT_NUM_SNPS: usize = 500;
+        const DEFAULT_NUM_SAMPLES: usize = 60;
 
-        let snp_major = gpu_ld::generate_dense_dataset(NUM_SNPS, NUM_SAMPLES, 20260720);
-        let sample_major = gpu_ld::transpose_dosage_matrix(&snp_major, NUM_SNPS, NUM_SAMPLES);
+        let (snp_major, num_snps, num_samples) =
+            load_snp_major_dense(DEFAULT_NUM_SNPS, DEFAULT_NUM_SAMPLES, 20260720)?;
+        let sample_major = gpu_ld::transpose_dosage_matrix(&snp_major, num_snps, num_samples);
 
-        let mut pairs = Vec::with_capacity(NUM_SAMPLES * (NUM_SAMPLES - 1) / 2);
-        for i in 0..NUM_SAMPLES {
-            for j in (i + 1)..NUM_SAMPLES {
+        let mut pairs = Vec::with_capacity(num_samples * (num_samples - 1) / 2);
+        for i in 0..num_samples {
+            for j in (i + 1)..num_samples {
                 pairs.push((i as u32, j as u32));
             }
         }
 
         let (correlations, compute_path) = match gpu_ld::GpuLdContext::shared() {
             Ok(ctx) => {
-                let r = ctx.compute_correlation_batch(&sample_major, NUM_SAMPLES, NUM_SNPS, &pairs)?;
+                let r = ctx.compute_correlation_batch(&sample_major, num_samples, num_snps, &pairs)?;
                 (r, format!("GPU ({})", ctx.adapter_name))
             }
             Err(_) => {
-                let r = gpu_ld::cpu_correlation_batch(&sample_major, NUM_SNPS, &pairs);
+                let r = gpu_ld::cpu_correlation_batch(&sample_major, num_snps, &pairs);
                 (r, "CPU (no GPU adapter available)".to_string())
             }
         };
 
-        let mut matrix = vec![0f64; NUM_SAMPLES * NUM_SAMPLES];
-        for i in 0..NUM_SAMPLES {
-            matrix[i * NUM_SAMPLES + i] = 1.0;
+        let mut matrix = vec![0f64; num_samples * num_samples];
+        for i in 0..num_samples {
+            matrix[i * num_samples + i] = 1.0;
         }
         for (idx, &(i, j)) in pairs.iter().enumerate() {
             let r = correlations[idx] as f64;
-            matrix[i as usize * NUM_SAMPLES + j as usize] = r;
-            matrix[j as usize * NUM_SAMPLES + i as usize] = r;
+            matrix[i as usize * num_samples + j as usize] = r;
+            matrix[j as usize * num_samples + i as usize] = r;
         }
 
-        let eigenpairs = pca::top_k_eigenpairs(&matrix, NUM_SAMPLES, 1, 150, 20260720);
-        let projections = pca::project(&matrix, NUM_SAMPLES, &eigenpairs);
+        let eigenpairs = pca::top_k_eigenpairs(&matrix, num_samples, 1, 150, 20260720);
+        let projections = pca::project(&matrix, num_samples, &eigenpairs);
         let (group_a, group_b) = fst::split_by_pc1_sign(&projections);
 
         if group_a.is_empty() || group_b.is_empty() {
             return Ok(format!(
-                "Selection Scan / FST Analysis (synthetic dataset, {} SNPs x {} samples, compute: {}):\n\n\
+                "Selection Scan / FST Analysis ({}, {} SNPs x {} samples, compute: {}):\n\n\
                  PC1 sign split produced an empty group this run ({} vs {}) -- no two-way structure \
                  detected along PC1 for this dataset/seed, so no FST scan was run. This is a real \
                  (not fabricated) null result, not an error.",
-                NUM_SNPS, NUM_SAMPLES, compute_path, group_a.len(), group_b.len()
+                dataset_label(), num_snps, num_samples, compute_path, group_a.len(), group_b.len()
             ));
         }
 
-        let mut results = fst::per_snp_fst(&snp_major, NUM_SNPS, NUM_SAMPLES, &group_a, &group_b);
+        let mut results = fst::per_snp_fst(&snp_major, num_snps, num_samples, &group_a, &group_b);
         results.sort_by(|a, b| b.fst.partial_cmp(&a.fst).unwrap());
         let mean_fst: f64 = results.iter().map(|r| r.fst).sum::<f64>() / results.len().max(1) as f64;
 
         let elapsed = start.elapsed();
 
         let mut out = format!(
-            "Selection Scan / FST Analysis (synthetic dataset, {} SNPs, {} vs {} samples split by PC1 sign, compute: {}):\n\n\
+            "Selection Scan / FST Analysis ({}, {} SNPs, {} vs {} samples split by PC1 sign, compute: {}):\n\n\
              Top 5 SNPs by FST (candidates for population differentiation):\n",
-            NUM_SNPS, group_a.len(), group_b.len(), compute_path
+            dataset_label(), num_snps, group_a.len(), group_b.len(), compute_path
         );
         for (rank, r) in results.iter().take(5).enumerate() {
             out.push_str(&format!(
