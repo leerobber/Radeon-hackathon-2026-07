@@ -4,6 +4,7 @@ mod bench;
 mod vcf;
 mod gpu_ld;
 mod pca;
+mod llm;
 
 use agent::GenomicAgent;
 use tools::ToolRegistry;
@@ -73,7 +74,7 @@ fn fast_mode() -> anyhow::Result<()> {
     ];
 
     for query in queries {
-        let _response = agent.process_query(query)?;
+        let _response = agent.process_query_offline(query)?;
     }
 
     println!("✓ 3 queries processed in ultra-fast mode");
