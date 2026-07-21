@@ -32,12 +32,15 @@ echo "✓ Rust $(rustc --version)"
 # Check Cargo
 echo "✓ Cargo $(cargo --version)"
 
-# Check for Radeon GPU tools (optional)
+# GPU acceleration in this project uses wgpu/Vulkan, not ROCm/HIP --
+# see README_PROFESSIONAL.md section 5 for exactly why. ROCm presence
+# is irrelevant to whether the GPU code path works; this is just an
+# informational check, not a requirement either way.
 if command -v rocm-smi &> /dev/null; then
-    echo "✓ ROCm detected:"
+    echo "✓ ROCm also detected (not required or used by this build):"
     rocm-smi --version
 else
-    echo "⚠ ROCm not found (OK for CPU mode, required for GPU optimization)"
+    echo "i ROCm not found -- not needed; GPU acceleration here uses wgpu/Vulkan"
 fi
 
 echo ""
@@ -57,10 +60,14 @@ echo "Setup complete! Ready to run."
 echo "────────────────────────────────────────────────────────────"
 echo ""
 echo "Quick start commands:"
-echo "  1. Run demo:        cargo run --release"
-echo "  2. Run benchmarks:  cargo run --release -- bench"
+echo "  1. Run demo (synthetic data):        cargo run --release"
+echo "  2. Run demo (real 1000 Genomes data): GENOMIC_AGENT_REAL_DATA=1 cargo run --release"
+echo "  3. Run benchmarks:                    cargo run --release -- bench"
+echo "  4. Run GPU benchmark + cross-check:   cargo run --release -- gpu-bench"
 echo ""
-echo "Note: this build has no GPU/ROCm code path. RADEON_API_KEY is not"
-echo "read anywhere in src/ -- setting it has no effect. See README_PROFESSIONAL.md"
-echo "section 5 (GPU/ROCm status) for details."
+echo "This build has real GPU acceleration (wgpu/Vulkan, explicitly AMD-"
+echo "adapter-targeted) for LD, PCA, and tool-planning compute -- not the"
+echo "literal ROCm/HIP API, and not RADEON_API_KEY, which is not read"
+echo "anywhere in src/. See README_PROFESSIONAL.md section 5 for exactly"
+echo "what that means and doesn't mean."
 echo ""

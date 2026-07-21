@@ -52,11 +52,15 @@ echo Setup complete! Ready to run.
 echo ────────────────────────────────────────────────────────────
 echo.
 echo Quick start commands:
-echo   1. Run demo:        cargo run --release
-echo   2. Run benchmarks:  cargo run --release -- bench
+echo   1. Run demo (synthetic data):        cargo run --release
+echo   2. Run demo (real 1000 Genomes data): set GENOMIC_AGENT_REAL_DATA=1 ^&^& cargo run --release
+echo   3. Run benchmarks:                    cargo run --release -- bench
+echo   4. Run GPU benchmark + cross-check:   cargo run --release -- gpu-bench
 echo.
-echo Note: this build has no GPU/ROCm code path. RADEON_API_KEY is not
-echo read anywhere in src/ -- setting it has no effect. See README_PROFESSIONAL.md
-echo section 5 (GPU/ROCm status) for details.
+echo This build has real GPU acceleration (wgpu/Vulkan, explicitly AMD-
+echo adapter-targeted) for LD, PCA, and tool-planning compute -- not the
+echo literal ROCm/HIP API, and not RADEON_API_KEY, which is not read
+echo anywhere in src/. See README_PROFESSIONAL.md section 5 for exactly
+echo what that means and doesn't mean.
 echo.
 pause
