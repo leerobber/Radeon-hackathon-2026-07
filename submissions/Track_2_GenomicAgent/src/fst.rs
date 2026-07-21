@@ -19,9 +19,15 @@
 //! would need its own cross-validation, same as every other GPU path in
 //! this crate) for no measurable speed benefit. What genuinely is
 //! GPU-accelerated is the clustering this depends on: the PC1 split
-//! comes from the same GPU-computed sample correlation matrix
-//! `PopulationStructureTool` already builds (see gpu_ld.rs), not
-//! recomputed here.
+//! comes from the same GPU-dispatched sample correlation kernel
+//! `PopulationStructureTool` uses (`gpu_ld::sample_correlation_matrix`)
+//! -- the same *technique*, not a cached result, since tools in this
+//! crate don't share state across calls (`Tool::execute` takes no
+//! context from any other tool's run), so `SelectionScanTool`
+//! genuinely recomputes its own correlation matrix independently, it
+//! just does so via the same shared, cross-validated GPU code path.
+
+use crate::rng::Xorshift64;
 
 pub struct FstResult {
     pub snp_index: usize,
@@ -108,24 +114,13 @@ pub fn per_snp_fst(
 
 /// Per-SNP result of the permutation significance test: how the real,
 /// observed FST compares to FST computed under many *random* relabelings
-/// of the same samples into two groups of the same sizes.
+/// of the same samples into two groups of the same sizes. Deliberately
+/// just the p-value, not an echo of `snp_index`/`n_permutations` --
+/// every caller already has those (SNP index from the paired
+/// `FstResult`, permutation count from its own `n_permutations`
+/// argument), so carrying them here would just be dead weight.
 pub struct FstPermutationResult {
-    pub snp_index: usize,
-    pub observed_fst: f64,
     pub p_value: f64,
-    pub n_permutations: usize,
-}
-
-struct Xorshift64(u64);
-impl Xorshift64 {
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
 }
 
 /// Empirical permutation-test p-value for every SNP's observed FST: a
@@ -188,12 +183,8 @@ pub fn permutation_test(
         }
     }
 
-    observed
-        .iter()
-        .enumerate()
-        .map(|(i, obs)| FstPermutationResult {
-            snp_index: obs.snp_index,
-            observed_fst: obs.fst,
+    (0..observed.len())
+        .map(|i| FstPermutationResult {
             // +1 smoothing in both numerator and denominator (standard
             // practice for permutation p-values, e.g. North, Curtis &
             // Sham 2002): with a finite number of permutations, "0 of N
@@ -201,7 +192,6 @@ pub fn permutation_test(
             // only that it's below roughly 1/N -- this never reports an
             // unjustified p=0.
             p_value: (exceed_counts[i] as f64 + 1.0) / (n_permutations as f64 + 1.0),
-            n_permutations,
         })
         .collect()
 }
@@ -342,19 +332,24 @@ mod tests {
 
     #[test]
     fn permutation_test_preserves_snp_order_and_count() {
-        let num_snps = 5;
-        let num_samples = 20;
-        let snp_major: Vec<f32> = (0..num_snps * num_samples).map(|i| (i % 3) as f32).collect();
-        let group_a: Vec<usize> = (0..10).collect();
-        let group_b: Vec<usize> = (10..20).collect();
+        // 3 SNPs with deliberately distinct group effects (real / none /
+        // real) -- if the returned results weren't aligned 1:1 with the
+        // input SNP order, the low p-values wouldn't land on the SNPs
+        // that actually have a real effect.
+        let num_samples = 30;
+        let group_a: Vec<usize> = (0..15).collect();
+        let group_b: Vec<usize> = (15..30).collect();
+        let mut snp_major = Vec::new();
+        snp_major.extend((0..num_samples).map(|i| if i < 15 { 0.0f32 } else { 2.0 })); // SNP 0: real effect
+        snp_major.extend(vec![1.0f32; num_samples]); // SNP 1: no effect
+        snp_major.extend((0..num_samples).map(|i| if i < 15 { 0.0f32 } else { 2.0 })); // SNP 2: real effect
 
-        let observed = per_snp_fst(&snp_major, num_snps, num_samples, &group_a, &group_b);
-        let perm = permutation_test(&snp_major, num_snps, num_samples, &group_a, &group_b, &observed, 20, 42);
-        assert_eq!(perm.len(), num_snps);
-        for (i, p) in perm.iter().enumerate() {
-            assert_eq!(p.snp_index, i);
-            assert_eq!(p.n_permutations, 20);
-            assert!((p.observed_fst - observed[i].fst).abs() < 1e-12);
-        }
+        let observed = per_snp_fst(&snp_major, 3, num_samples, &group_a, &group_b);
+        let perm = permutation_test(&snp_major, 3, num_samples, &group_a, &group_b, &observed, 100, 42);
+
+        assert_eq!(perm.len(), 3);
+        assert!(perm[0].p_value < 0.05, "SNP 0 has a real effect, expected significant, got p={}", perm[0].p_value);
+        assert!(perm[1].p_value > 0.5, "SNP 1 has no effect, expected non-significant, got p={}", perm[1].p_value);
+        assert!(perm[2].p_value < 0.05, "SNP 2 has a real effect, expected significant, got p={}", perm[2].p_value);
     }
 }

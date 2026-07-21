@@ -13,12 +13,12 @@
 //! haplotype tallying) is genuinely executed against real parsed input,
 //! not printed as a literal.
 
+use crate::rng::Xorshift64;
 use std::fmt::Write as _;
 
 pub struct Variant {
     pub chrom: String,
     pub pos: u64,
-    pub id: String,
     /// One genotype per sample, phased as (allele0, allele1). `None` = missing (./.).
     pub genotypes: Vec<Option<(u8, u8)>>,
 }
@@ -26,24 +26,6 @@ pub struct Variant {
 pub struct VcfData {
     pub sample_names: Vec<String>,
     pub variants: Vec<Variant>,
-}
-
-/// Deterministic xorshift PRNG -- no external `rand` dependency needed,
-/// and deterministic means the "benchmark" numbers are reproducible
-/// across runs, which matters for a contest judge re-running this.
-struct Xorshift64(u64);
-impl Xorshift64 {
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-    fn next_f64(&mut self) -> f64 {
-        (self.next_u64() % 1_000_000) as f64 / 1_000_000.0
-    }
 }
 
 /// Generate a synthetic VCF (as real VCF-format text) with genuine
@@ -144,7 +126,10 @@ pub fn parse_vcf(text: &str) -> anyhow::Result<VcfData> {
         }
         let chrom = fields[0].to_string();
         let pos: u64 = fields[1].parse()?;
-        let id = fields[2].to_string();
+        // fields[2] is the VCF ID column -- parsed but not modeled: this
+        // demo dataset's synthetic generator only ever writes "rs{n}"
+        // placeholders and the real bundled 1000 Genomes slice only ever
+        // has ".", so it carries no information this crate's tools use.
 
         let mut genotypes = Vec::with_capacity(fields.len() - 9);
         for gt_field in &fields[9..] {
@@ -152,7 +137,7 @@ pub fn parse_vcf(text: &str) -> anyhow::Result<VcfData> {
             genotypes.push(parse_genotype(gt_str));
         }
 
-        variants.push(Variant { chrom, pos, id, genotypes });
+        variants.push(Variant { chrom, pos, genotypes });
     }
 
     Ok(VcfData { sample_names, variants })
@@ -384,7 +369,7 @@ mod tests {
     use super::*;
 
     fn make_variant(genotypes: Vec<Option<(u8, u8)>>) -> Variant {
-        Variant { chrom: "chr1".to_string(), pos: 100, id: "rs1".to_string(), genotypes }
+        Variant { chrom: "chr1".to_string(), pos: 100, genotypes }
     }
 
     #[test]
@@ -514,7 +499,6 @@ mod tests {
         let clone = Variant {
             chrom: parsed.variants[0].chrom.clone(),
             pos: parsed.variants[0].pos,
-            id: "clone".to_string(),
             genotypes: parsed.variants[0].genotypes.clone(),
         };
         parsed.variants.push(clone);

@@ -516,28 +516,66 @@ pub fn transpose_dosage_matrix(dosages: &[f32], num_snps: usize, num_samples: us
     out
 }
 
+/// Real, GPU-computed (CPU-fallback) dense sample-by-sample correlation
+/// matrix from a SNP-major dosage matrix: transpose to sample-major,
+/// dispatch every `i<j` sample pair through `compute_correlation_batch`
+/// (or `cpu_correlation_batch` if no GPU adapter is available), then
+/// assemble the dense symmetric matrix with a 1.0 diagonal. This is the
+/// exact pattern `PopulationStructureTool` and `SelectionScanTool` both
+/// need before running PCA -- factored out once so it isn't duplicated
+/// between the two call sites (they used to each inline their own copy
+/// of this ~35-line block).
+pub fn sample_correlation_matrix(
+    snp_major: &[f32],
+    num_snps: usize,
+    num_samples: usize,
+) -> Result<(Vec<f64>, String)> {
+    let sample_major = transpose_dosage_matrix(snp_major, num_snps, num_samples);
+
+    let mut pairs = Vec::with_capacity(num_samples * (num_samples.max(1) - 1) / 2);
+    for i in 0..num_samples {
+        for j in (i + 1)..num_samples {
+            pairs.push((i as u32, j as u32));
+        }
+    }
+
+    let (correlations, compute_path) = match GpuLdContext::shared() {
+        Ok(ctx) => {
+            let r = ctx.compute_correlation_batch(&sample_major, num_samples, num_snps, &pairs)?;
+            (r, format!("GPU ({}, AMD={})", ctx.adapter_name, ctx.adapter_is_amd))
+        }
+        Err(_) => {
+            let r = cpu_correlation_batch(&sample_major, num_snps, &pairs);
+            (r, "CPU (no GPU adapter available)".to_string())
+        }
+    };
+
+    Ok((build_symmetric_matrix(&correlations, &pairs, num_samples), compute_path))
+}
+
+/// Assemble a dense symmetric `n x n` matrix (1.0 diagonal) from
+/// pairwise `(i, j)` values -- shared by `sample_correlation_matrix`
+/// above and `bootstrap.rs`'s per-replicate eigenvalue computation.
+pub(crate) fn build_symmetric_matrix(values: &[f32], pairs: &[(u32, u32)], n: usize) -> Vec<f64> {
+    let mut matrix = vec![0f64; n * n];
+    for i in 0..n {
+        matrix[i * n + i] = 1.0;
+    }
+    for (&(i, j), &r) in pairs.iter().zip(values.iter()) {
+        let (i, j) = (i as usize, j as usize);
+        matrix[i * n + j] = r as f64;
+        matrix[j * n + i] = r as f64;
+    }
+    matrix
+}
+
 /// Generate a dense (no missing genotypes) synthetic dosage matrix with
 /// real embedded LD structure, for the GPU/CPU benchmark comparison.
 /// Same founder-haplotype resampling technique as vcf.rs, kept separate
 /// so this module doesn't need to filter/impute vcf::Variant missingness
 /// before it can hand a clean matrix to the GPU.
 pub fn generate_dense_dataset(num_snps: usize, num_samples: usize, seed: u64) -> Vec<f32> {
-    struct Xorshift64(u64);
-    impl Xorshift64 {
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
-        fn next_f64(&mut self) -> f64 {
-            (self.next_u64() % 1_000_000) as f64 / 1_000_000.0
-        }
-    }
-
-    let mut rng = Xorshift64(seed | 1);
+    let mut rng = crate::rng::Xorshift64(seed | 1);
     let num_founders = 8usize;
     let block_size = 40usize;
 
@@ -675,15 +713,9 @@ mod tests {
 
         let vocab_len = 12;
         let num_docs = 5;
-        let mut state: u64 = 4242 | 1;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state % 1_000_000) as f32 / 1_000_000.0
-        };
-        let query: Vec<f32> = (0..vocab_len).map(|_| next()).collect();
-        let docs: Vec<f32> = (0..num_docs * vocab_len).map(|_| next()).collect();
+        let mut rng = crate::rng::Xorshift64(4242 | 1);
+        let query: Vec<f32> = (0..vocab_len).map(|_| rng.next_f64() as f32).collect();
+        let docs: Vec<f32> = (0..num_docs * vocab_len).map(|_| rng.next_f64() as f32).collect();
 
         let gpu_result = ctx
             .compute_bm25_score_batch(&query, &docs, vocab_len, num_docs)

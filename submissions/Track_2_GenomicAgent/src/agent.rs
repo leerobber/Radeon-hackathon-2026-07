@@ -26,7 +26,7 @@ impl GenomicAgent {
     }
 
     /// Real, zero-cost, offline planning (see intent.rs -- a custom
-    /// GPU-dispatched TF-IDF/cosine-similarity kernel, not a
+    /// GPU-dispatched Okapi BM25 (with bigram features) kernel, not a
     /// transformer, not an external model) decides which tool(s) the
     /// query needs, possibly more than one for a compound question. If
     /// an LLM backend is separately configured and reachable (see

@@ -19,6 +19,7 @@
 //! bootstrap CI computed on CPU is still a real bootstrap CI, just
 //! slower.
 
+use crate::rng::Xorshift64;
 use crate::{gpu_ld, pca};
 use anyhow::Result;
 
@@ -28,18 +29,6 @@ pub struct BootstrapCi {
     pub ci_high: f64,
     pub n_replicates: usize,
     pub compute_path: String,
-}
-
-struct Xorshift64(u64);
-impl Xorshift64 {
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
 }
 
 /// 95% percentile bootstrap interval from a sorted-in-place sample of
@@ -177,7 +166,7 @@ pub fn bootstrap_top_eigenvalue_ci(
     let mut eigenvalues = Vec::with_capacity(n_replicates);
     for b in 0..n_replicates {
         let slice = &correlations[b * pairs_per_rep..(b + 1) * pairs_per_rep];
-        let matrix = build_symmetric_matrix(slice, &all_pairs, num_samples);
+        let matrix = gpu_ld::build_symmetric_matrix(slice, &all_pairs, num_samples);
         let ep = pca::top_k_eigenpairs(&matrix, num_samples, 1, 150, seed.wrapping_add(b as u64 + 2));
         eigenvalues.push(ep[0].eigenvalue);
     }
@@ -204,22 +193,9 @@ fn top_eigenvalue_from_correlations(
         Ok(ctx) => ctx.compute_correlation_batch(sample_major, num_samples, num_snps, pairs)?,
         Err(_) => gpu_ld::cpu_correlation_batch(sample_major, num_snps, pairs),
     };
-    let matrix = build_symmetric_matrix(&correlations, pairs, num_samples);
+    let matrix = gpu_ld::build_symmetric_matrix(&correlations, pairs, num_samples);
     let ep = pca::top_k_eigenpairs(&matrix, num_samples, 1, 150, seed);
     Ok(ep[0].eigenvalue)
-}
-
-fn build_symmetric_matrix(values: &[f32], pairs: &[(u32, u32)], n: usize) -> Vec<f64> {
-    let mut matrix = vec![0f64; n * n];
-    for i in 0..n {
-        matrix[i * n + i] = 1.0;
-    }
-    for (&(i, j), &r) in pairs.iter().zip(values.iter()) {
-        let (i, j) = (i as usize, j as usize);
-        matrix[i * n + j] = r as f64;
-        matrix[j * n + i] = r as f64;
-    }
-    matrix
 }
 
 #[cfg(test)]

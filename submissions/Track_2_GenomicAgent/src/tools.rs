@@ -71,7 +71,15 @@ impl Tool for VcfAnalyzerTool {
 
         let data = load_dataset()?;
         let stats: Vec<_> = data.variants.iter().map(vcf::compute_variant_stats).collect();
-        let hwe_results: Vec<_> = data.variants.iter().filter_map(vcf::compute_hwe).collect();
+        // Paired with each variant's index so the worst-fitting SNP
+        // (below) can be reported by real position, not just a bare
+        // chi-square number.
+        let hwe_results: Vec<(usize, vcf::HweResult)> = data
+            .variants
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| vcf::compute_hwe(v).map(|h| (i, h)))
+            .collect();
 
         let total_snps = stats.len();
         let common_snps = stats.iter().filter(|s| s.maf > 0.05).count();
@@ -82,8 +90,8 @@ impl Tool for VcfAnalyzerTool {
         // Real chi-square HWE test per variant (see vcf::compute_hwe).
         // p < 0.001 flags a variant for QC review -- standard threshold
         // used to catch genotyping errors or population stratification.
-        let hwe_fail_count = hwe_results.iter().filter(|h| h.p_value < 0.001).count();
-        let mean_hwe_chi2 = hwe_results.iter().map(|h| h.chi_square).sum::<f64>() / hwe_results.len().max(1) as f64;
+        let hwe_fail_count = hwe_results.iter().filter(|(_, h)| h.p_value < 0.001).count();
+        let mean_hwe_chi2 = hwe_results.iter().map(|(_, h)| h.chi_square).sum::<f64>() / hwe_results.len().max(1) as f64;
 
         let elapsed = start.elapsed();
 
@@ -110,6 +118,22 @@ impl Tool for VcfAnalyzerTool {
             mean_hwe_chi2,
             elapsed.as_secs_f64() * 1000.0,
         );
+
+        // Worst-fitting SNP's real observed vs. expected genotype
+        // counts -- these are already computed by compute_hwe for every
+        // variant (that's what the chi-square above is built from), so
+        // this surfaces real numbers already sitting in memory rather
+        // than discarding them once the summary chi-square is taken.
+        if let Some((idx, worst)) = hwe_results.iter().max_by(|a, b| a.1.chi_square.partial_cmp(&b.1.chi_square).unwrap()) {
+            let v = &data.variants[*idx];
+            result.push_str(&format!(
+                "\n- Worst-fitting SNP by HWE chi-square: {}:{}, chi²={:.3}\n  \
+                   observed (hom_ref/het/hom_alt): {}/{}/{}, expected: {:.1}/{:.1}/{:.1}",
+                v.chrom, v.pos, worst.chi_square,
+                worst.obs_hom_ref, worst.obs_het, worst.obs_hom_alt,
+                worst.exp_hom_ref, worst.exp_het, worst.exp_hom_alt,
+            ));
+        }
 
         if vcf::use_real_data() {
             result.push_str(
@@ -337,38 +361,13 @@ impl Tool for PopulationStructureTool {
             load_snp_major_dense(DEFAULT_NUM_SNPS, DEFAULT_NUM_SAMPLES, 20260720)?;
         let sample_major = gpu_ld::transpose_dosage_matrix(&snp_major, num_snps, num_samples);
 
-        let mut pairs = Vec::with_capacity(num_samples * (num_samples - 1) / 2);
-        for i in 0..num_samples {
-            for j in (i + 1)..num_samples {
-                pairs.push((i as u32, j as u32));
-            }
-        }
-
-        let (correlations, compute_path) = match gpu_ld::GpuLdContext::shared() {
-            Ok(ctx) => {
-                let r = ctx.compute_correlation_batch(&sample_major, num_samples, num_snps, &pairs)?;
-                (r, format!("GPU ({}, AMD={})", ctx.adapter_name, ctx.adapter_is_amd))
-            }
-            Err(_) => {
-                let r = gpu_ld::cpu_correlation_batch(&sample_major, num_snps, &pairs);
-                (r, "CPU (no GPU adapter available)".to_string())
-            }
-        };
-
-        // Build the dense symmetric n x n correlation matrix (f64 for
-        // PCA's numerical stability) from the pairwise results. Diagonal
-        // is exactly 1.0 (a sample perfectly correlates with itself),
-        // not computed -- computing self-correlation would divide by
-        // zero variance in exactly the degenerate way you'd expect.
-        let mut matrix = vec![0f64; num_samples * num_samples];
-        for i in 0..num_samples {
-            matrix[i * num_samples + i] = 1.0;
-        }
-        for (idx, &(i, j)) in pairs.iter().enumerate() {
-            let r = correlations[idx] as f64;
-            matrix[i as usize * num_samples + j as usize] = r;
-            matrix[j as usize * num_samples + i as usize] = r;
-        }
+        // Dense symmetric n x n correlation matrix (f64 for PCA's
+        // numerical stability; diagonal is exactly 1.0 -- a sample
+        // perfectly correlates with itself, not computed, since
+        // computing self-correlation would divide by zero variance).
+        // Same GPU-dispatched (CPU-fallback) helper `SelectionScanTool`
+        // uses -- see `gpu_ld::sample_correlation_matrix`'s doc comment.
+        let (matrix, compute_path) = gpu_ld::sample_correlation_matrix(&snp_major, num_snps, num_samples)?;
 
         let eigenpairs = pca::top_k_eigenpairs(&matrix, num_samples, NUM_COMPONENTS, 150, 20260720);
         let projections = pca::project(&matrix, num_samples, &eigenpairs);
@@ -527,35 +526,12 @@ impl Tool for SelectionScanTool {
 
         let (snp_major, num_snps, num_samples) =
             load_snp_major_dense(DEFAULT_NUM_SNPS, DEFAULT_NUM_SAMPLES, 20260720)?;
-        let sample_major = gpu_ld::transpose_dosage_matrix(&snp_major, num_snps, num_samples);
 
-        let mut pairs = Vec::with_capacity(num_samples * (num_samples - 1) / 2);
-        for i in 0..num_samples {
-            for j in (i + 1)..num_samples {
-                pairs.push((i as u32, j as u32));
-            }
-        }
-
-        let (correlations, compute_path) = match gpu_ld::GpuLdContext::shared() {
-            Ok(ctx) => {
-                let r = ctx.compute_correlation_batch(&sample_major, num_samples, num_snps, &pairs)?;
-                (r, format!("GPU ({})", ctx.adapter_name))
-            }
-            Err(_) => {
-                let r = gpu_ld::cpu_correlation_batch(&sample_major, num_snps, &pairs);
-                (r, "CPU (no GPU adapter available)".to_string())
-            }
-        };
-
-        let mut matrix = vec![0f64; num_samples * num_samples];
-        for i in 0..num_samples {
-            matrix[i * num_samples + i] = 1.0;
-        }
-        for (idx, &(i, j)) in pairs.iter().enumerate() {
-            let r = correlations[idx] as f64;
-            matrix[i as usize * num_samples + j as usize] = r;
-            matrix[j as usize * num_samples + i as usize] = r;
-        }
+        // Same GPU-dispatched (CPU-fallback) correlation-matrix helper
+        // `PopulationStructureTool` uses -- computed independently here
+        // since tools don't share state across calls, not a cached
+        // result (see gpu_ld::sample_correlation_matrix's doc comment).
+        let (matrix, compute_path) = gpu_ld::sample_correlation_matrix(&snp_major, num_snps, num_samples)?;
 
         let eigenpairs = pca::top_k_eigenpairs(&matrix, num_samples, 1, 150, 20260720);
         let projections = pca::project(&matrix, num_samples, &eigenpairs);

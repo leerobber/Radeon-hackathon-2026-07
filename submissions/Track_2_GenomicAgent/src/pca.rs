@@ -15,25 +15,12 @@
 //! relationship matrix, and clusters in that projection correspond to
 //! shared ancestry / population structure.
 
+use crate::rng::Xorshift64;
+
 /// One eigenpair: eigenvalue and its (unit-length) eigenvector.
 pub struct EigenPair {
     pub eigenvalue: f64,
     pub eigenvector: Vec<f64>,
-}
-
-struct Xorshift64(u64);
-impl Xorshift64 {
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-    fn next_f64_signed(&mut self) -> f64 {
-        (self.next_u64() % 2_000_000) as f64 / 1_000_000.0 - 1.0 // in [-1, 1)
-    }
 }
 
 fn mat_vec_mul(matrix: &[f64], n: usize, v: &[f64]) -> Vec<f64> {

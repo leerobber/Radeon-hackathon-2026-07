@@ -8,6 +8,7 @@ mod llm;
 mod bootstrap;
 mod fst;
 mod intent;
+mod rng;
 #[cfg(feature = "local-inference")]
 mod local_llm;
 

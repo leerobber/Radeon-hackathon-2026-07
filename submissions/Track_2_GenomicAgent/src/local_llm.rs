@@ -71,8 +71,26 @@ fn shared() -> Result<&'static LocalModel> {
 }
 
 fn load_model() -> Result<LocalModel> {
-    let path = local_model_path().context("LOCAL_MODEL_GGUF_PATH not set")?;
     let backend = LlamaBackend::init().context("failed to init llama.cpp backend")?;
+    // "all layers" -- llama.cpp's own convention, see `load_model_only`'s doc comment.
+    let (model, device_summary) = load_model_only(&backend, 1000)?;
+    Ok(LocalModel {
+        backend,
+        model,
+        device_summary,
+    })
+}
+
+/// Loads a model file against an *existing* backend, for the CPU-vs-GPU
+/// comparison in `run_local_bench`. Deliberately does not call
+/// `LlamaBackend::init()` again: it's a process-wide singleton (an
+/// `AtomicBool` guard inside `llama-cpp-2` itself) that errors with
+/// `BackendAlreadyInitialized` on a second call while the first
+/// instance -- held forever inside `SHARED_MODEL` -- is still alive.
+/// Reusing the shared backend for a second, independent `LlamaModel`
+/// load is supported and is exactly what this needs.
+fn load_model_only(backend: &LlamaBackend, n_gpu_layers: u32) -> Result<(LlamaModel, String)> {
+    let path = local_model_path().context("LOCAL_MODEL_GGUF_PATH not set")?;
 
     let devices = llama_cpp_2::list_llama_ggml_backend_devices();
     let all_devices_summary = devices
@@ -81,11 +99,11 @@ fn load_model() -> Result<LocalModel> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Offload every layer to the GPU (a value larger than any real
-    // model's layer count means "all of them" -- llama.cpp's own
-    // convention, see the upstream `simple` example this module's API
-    // usage is based on).
-    let mut model_params = LlamaModelParams::default().with_n_gpu_layers(1000);
+    // n_gpu_layers larger than any real model's layer count means "all
+    // of them" -- llama.cpp's own convention, see the upstream `simple`
+    // example this module's API usage is based on. 0 means CPU-only,
+    // used for the CPU-vs-GPU comparison in `run_local_bench`.
+    let mut model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
 
     // Machines with both an AMD iGPU and a discrete non-AMD GPU expose
     // multiple Vulkan devices -- llama.cpp's default picker chooses
@@ -94,7 +112,8 @@ fn load_model() -> Result<LocalModel> {
     // this dev machine: a Radeon 780M iGPU alongside an RTX 5050
     // dGPU, where the default picker silently chose the RTX). Find the
     // AMD device by name and pin to it explicitly so this feature
-    // always exercises what it claims to.
+    // always exercises what it claims to. Pinning is harmless when
+    // n_gpu_layers is 0 -- there's nothing to offload either way.
     let amd_device = devices.iter().find(|d| {
         let desc = d.description.to_lowercase();
         desc.contains("amd") || desc.contains("radeon")
@@ -109,14 +128,10 @@ fn load_model() -> Result<LocalModel> {
         format!("{all_devices_summary} -- no AMD device found, using llama.cpp's default device selection")
     };
 
-    let model = LlamaModel::load_from_file(&backend, &path, &model_params)
+    let model = LlamaModel::load_from_file(backend, &path, &model_params)
         .with_context(|| format!("failed to load GGUF model from {path}"))?;
 
-    Ok(LocalModel {
-        backend,
-        model,
-        device_summary,
-    })
+    Ok((model, device_summary))
 }
 
 fn qwen_chatml_prompt(system: &str, user: &str) -> String {
@@ -139,7 +154,7 @@ pub fn call_local_model(system: &str, user: &str, max_tokens: u32) -> Option<Str
         }
     };
 
-    match generate(local, system, user, max_tokens) {
+    match generate(&local.backend, &local.model, system, user, max_tokens) {
         Ok((text, _tokens, _elapsed)) => Some(text),
         Err(e) => {
             eprintln!("[local_llm] generation failed, trying next backend: {e}");
@@ -149,7 +164,8 @@ pub fn call_local_model(system: &str, user: &str, max_tokens: u32) -> Option<Str
 }
 
 fn generate(
-    local: &LocalModel,
+    backend: &LlamaBackend,
+    model: &LlamaModel,
     system: &str,
     user: &str,
     max_tokens: u32,
@@ -157,13 +173,11 @@ fn generate(
     let prompt = qwen_chatml_prompt(system, user);
 
     let ctx_params = LlamaContextParams::default().with_n_ctx(Some(NonZeroU32::new(4096).unwrap()));
-    let mut ctx = local
-        .model
-        .new_context(&local.backend, ctx_params)
+    let mut ctx = model
+        .new_context(backend, ctx_params)
         .context("failed to create llama context")?;
 
-    let tokens = local
-        .model
+    let tokens = model
         .str_to_token(&prompt, AddBos::Always)
         .context("failed to tokenize prompt")?;
 
@@ -187,11 +201,10 @@ fn generate(
     while n_cur <= end {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
-        if local.model.is_eog_token(token) {
+        if model.is_eog_token(token) {
             break;
         }
-        let piece = local
-            .model
+        let piece = model
             .token_to_piece(token, &mut decoder, true, None)
             .context("failed to detokenize output")?;
         output.push_str(&piece);
@@ -208,9 +221,13 @@ fn generate(
 }
 
 /// `local-bench` CLI mode: run a fixed prompt, report real measured
-/// tokens/second and which backend/device llama.cpp actually used.
-/// Same "always measure, never invent a benchmark number" discipline as
-/// `bench.rs`'s `run_gpu_benchmark`.
+/// tokens/second and which backend/device llama.cpp actually used, then
+/// do the same on a fresh CPU-only (`n_gpu_layers=0`) load of the same
+/// model and the same prompt, for a real measured GPU speedup number --
+/// Track 2's rubric asks for "inference-speed optimization", not just
+/// "execution", so this makes the actual speedup a live, run-it-yourself
+/// number instead of an assumed one. Same "always measure, never invent
+/// a benchmark number" discipline as `bench.rs`'s `run_gpu_benchmark`.
 pub fn run_local_bench() -> Result<()> {
     let local = shared().context(
         "local-bench requires LOCAL_MODEL_GGUF_PATH to be set to a real GGUF model file",
@@ -223,21 +240,50 @@ pub fn run_local_bench() -> Result<()> {
     println!("Prompt: {prompt}");
     println!();
 
-    let (text, tokens, elapsed) = generate(
-        local,
+    println!("--- GPU run (Vulkan, offloaded) ---");
+    let (text, gpu_tokens, gpu_elapsed) = generate(
+        &local.backend,
+        &local.model,
         "You are a concise genomics analyst.",
         prompt,
         200,
     )?;
+    let gpu_tok_s = gpu_tokens as f64 / gpu_elapsed.as_secs_f64().max(0.001);
 
     println!("Response: {text}");
     println!();
     println!(
-        "Generated {} tokens in {:.2}s -- {:.2} tok/s (measured, real GPU dispatch via Vulkan)",
-        tokens,
-        elapsed.as_secs_f64(),
-        tokens as f64 / elapsed.as_secs_f64().max(0.001),
+        "Generated {gpu_tokens} tokens in {:.2}s -- {gpu_tok_s:.2} tok/s (measured, real GPU dispatch via Vulkan)",
+        gpu_elapsed.as_secs_f64(),
     );
+    println!();
+
+    println!("--- CPU run (n_gpu_layers=0, same model, same prompt) ---");
+    println!("Loading a fresh CPU-only instance on the same backend -- this reloads the whole model with GPU offload disabled, so it takes longer than the GPU run's generation step alone; that's expected.");
+    match load_model_only(&local.backend, 0) {
+        Ok((cpu_model, _device_summary)) => {
+            let (_text, cpu_tokens, cpu_elapsed) = generate(
+                &local.backend,
+                &cpu_model,
+                "You are a concise genomics analyst.",
+                prompt,
+                200,
+            )?;
+            let cpu_tok_s = cpu_tokens as f64 / cpu_elapsed.as_secs_f64().max(0.001);
+            println!(
+                "Generated {cpu_tokens} tokens in {:.2}s -- {cpu_tok_s:.2} tok/s (measured, CPU-only)",
+                cpu_elapsed.as_secs_f64(),
+            );
+            println!();
+            println!(
+                "GPU speedup: {:.2}x ({gpu_tok_s:.2} tok/s GPU vs {cpu_tok_s:.2} tok/s CPU, both measured this run)",
+                gpu_tok_s / cpu_tok_s.max(0.001),
+            );
+        }
+        Err(e) => {
+            println!("CPU-only comparison run failed, skipping speedup number: {e}");
+        }
+    }
 
     Ok(())
 }
