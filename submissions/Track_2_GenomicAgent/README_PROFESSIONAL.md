@@ -1,11 +1,33 @@
 # Genomic Research Agent
 
+[![Track 2 Genomic Agent CI](https://github.com/leerobber/Radeon-hackathon-2026-07/actions/workflows/track2-genomic-agent.yml/badge.svg)](https://github.com/leerobber/Radeon-hackathon-2026-07/actions/workflows/track2-genomic-agent.yml)
+
+*(CI builds the default configuration and runs the full test suite on an
+ordinary headless runner with no GPU — the GPU-specific tests skip
+themselves gracefully there, so a green badge means the default build
+compiles clean and the CPU-path suite passes. The GPU cross-validation
+and speedup numbers below are measured locally on real AMD hardware, as
+each section states.)*
+
 An agentic AI for real population-genetics workflows — six tools doing
 real statistics over real and synthetic VCF data, routed by a
 from-scratch GPU kernel with zero API dependency, narrated (optionally)
 by an LLM running *locally* on the AMD Radeon GPU itself. Every number
 below is measured, not asserted: run the command next to a claim and
 you'll get the same kind of result.
+
+> **For judges in a hurry.** An agentic genomics assistant whose tool
+> routing is a custom GPU-dispatched Okapi BM25 kernel — no API key, no
+> network, no cost — feeding six real statistical tools (HWE, LD/r²,
+> haplotypes, PCA, bootstrap CIs, permutation-tested FST) with real
+> `wgpu`/Vulkan GPU acceleration explicitly targeted at the AMD adapter
+> and cross-validated against a CPU reference on **every** run. Measured
+> **3.47× GPU LD speedup** and **real local LLM inference on the Radeon
+> 780M at 21.32 tok/s (1.52× vs CPU)** using a **Q4_K_M-quantized**
+> model. 42 property-based tests, zero compiler warnings, real bundled
+> 1000 Genomes data, and one honestly-kept null result. No ROCm/HIP SDK
+> required (uses Vulkan — see below for why). **Verify it in ~2 minutes:
+> `bash verify.sh` (or `verify.bat`).**
 
 ## At a glance
 
