@@ -29,6 +29,18 @@ you'll get the same kind of result.
 > required (uses Vulkan — see below for why). **Verify it in ~2 minutes:
 > `bash verify.sh` (or `verify.bat`).**
 
+## Demo video
+
+A 2-minute narrated walkthrough of the whole submission — the zero-API
+GPU router, the cross-validated AMD GPU acceleration, the measured local
+LLM inference, and the honestly-kept null result:
+
+**▶ [Watch the demo video](demo/genomic_agent_demo.mp4)** (`demo/genomic_agent_demo.mp4`, 1080p, ~2 min)
+
+Every figure on screen is one of the measured numbers documented below —
+nothing in the video is asserted without a command in this README that
+reproduces it.
+
 ## At a glance
 
 | | |

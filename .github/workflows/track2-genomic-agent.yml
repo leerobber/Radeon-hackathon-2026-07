@@ -29,19 +29,10 @@ jobs:
       run:
         working-directory: submissions/Track_2_GenomicAgent
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            submissions/Track_2_GenomicAgent/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('submissions/Track_2_GenomicAgent/Cargo.toml') }}
 
       - name: Build (release, default features)
         run: cargo build --release
